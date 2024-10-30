@@ -102,7 +102,7 @@ func TestParseInt32(t *testing.T) {
 		if (err == nil) != test.ok {
 			t.Errorf("#%d: Incorrect error result (did fail? %v, expected: %v)", i, err == nil, test.ok)
 		}
-		if test.ok && int32(ret) != test.out {
+		if test.ok && ret != test.out {
 			t.Errorf("#%d: Bad result: %v (expected %v)", i, ret, test.out)
 		}
 	}
@@ -323,6 +323,10 @@ func TestUTCTime(t *testing.T) {
 var generalizedTimeTestData = []timeTest{
 	{"20100102030405Z", true, time.Date(2010, 01, 02, 03, 04, 05, 0, time.UTC)},
 	{"20100102030405", false, time.Time{}},
+	{"20100102030405.123456Z", true, time.Date(2010, 01, 02, 03, 04, 05, 123456e3, time.UTC)},
+	{"20100102030405.123456", false, time.Time{}},
+	{"20100102030405.Z", false, time.Time{}},
+	{"20100102030405.", false, time.Time{}},
 	{"20100102030405+0607", true, time.Date(2010, 01, 02, 03, 04, 05, 0, time.FixedZone("", 6*60*60+7*60))},
 	{"20100102030405-0607", true, time.Date(2010, 01, 02, 03, 04, 05, 0, time.FixedZone("", -6*60*60-7*60))},
 	/* These are invalid times. However, the time package normalises times
@@ -479,7 +483,7 @@ type TestSet struct {
 
 var unmarshalTestData = []struct {
 	in  []byte
-	out interface{}
+	out any
 }{
 	{[]byte{0x02, 0x01, 0x42}, newInt(0x42)},
 	{[]byte{0x05, 0x00}, &RawValue{0, 5, false, []byte{}, []byte{0x05, 0x00}}},
@@ -521,7 +525,7 @@ func TestUnmarshal(t *testing.T) {
 func TestUnmarshalWithNilOrNonPointer(t *testing.T) {
 	tests := []struct {
 		b    []byte
-		v    interface{}
+		v    any
 		want string
 	}{
 		{b: []byte{0x05, 0x00}, v: nil, want: "asn1: Unmarshal recipient value is nil"},
@@ -567,7 +571,7 @@ type RelativeDistinguishedNameSET []AttributeTypeAndValue
 
 type AttributeTypeAndValue struct {
 	Type  ObjectIdentifier
-	Value interface{}
+	Value any
 }
 
 type Validity struct {
@@ -998,9 +1002,9 @@ func TestUnmarshalInvalidUTF8(t *testing.T) {
 }
 
 func TestMarshalNilValue(t *testing.T) {
-	nilValueTestData := []interface{}{
+	nilValueTestData := []any{
 		nil,
-		struct{ V interface{} }{},
+		struct{ V any }{},
 	}
 	for i, test := range nilValueTestData {
 		if _, err := Marshal(test); err == nil {
@@ -1162,5 +1166,12 @@ func TestNonMinimalEncodedOID(t *testing.T) {
 	_, err = Unmarshal(h, &oid)
 	if err == nil {
 		t.Fatalf("accepted non-minimally encoded oid")
+	}
+}
+
+func BenchmarkObjectIdentifierString(b *testing.B) {
+	oidPublicKeyRSA := ObjectIdentifier{1, 2, 840, 113549, 1, 1, 1}
+	for i := 0; i < b.N; i++ {
+		_ = oidPublicKeyRSA.String()
 	}
 }

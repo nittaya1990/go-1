@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build ignore
 // +build ignore
 
 // Addmod adds a module as a txtar archive to the testdata/mod directory.
@@ -15,21 +16,20 @@
 //
 // It is acceptable to edit the archive afterward to remove or shorten files.
 // See mod/README for more information.
-//
 package main
 
 import (
 	"bytes"
+	"cmd/go/internal/str"
 	"flag"
 	"fmt"
-	exec "internal/execabs"
+	"internal/txtar"
 	"io/fs"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
-
-	"golang.org/x/tools/txtar"
 )
 
 func usage() {
@@ -39,7 +39,7 @@ func usage() {
 
 var tmpdir string
 
-func fatalf(format string, args ...interface{}) {
+func fatalf(format string, args ...any) {
 	os.RemoveAll(tmpdir)
 	log.Fatalf(format, args...)
 }
@@ -131,7 +131,7 @@ func main() {
 				if err != nil {
 					return err
 				}
-				a.Files = append(a.Files, txtar.File{Name: strings.TrimPrefix(path, dir+string(filepath.Separator)), Data: data})
+				a.Files = append(a.Files, txtar.File{Name: str.TrimFilePathPrefix(path, dir), Data: data})
 			}
 			return nil
 		})

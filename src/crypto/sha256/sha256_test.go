@@ -8,10 +8,12 @@ package sha256
 
 import (
 	"bytes"
-	"crypto/rand"
+	"crypto/internal/boring"
+	"crypto/internal/cryptotest"
 	"encoding"
 	"fmt"
 	"hash"
+	"internal/testenv"
 	"io"
 	"testing"
 )
@@ -91,8 +93,11 @@ var golden224 = []sha256Test{
 }
 
 func TestGolden(t *testing.T) {
-	for i := 0; i < len(golden); i++ {
-		g := golden[i]
+	cryptotest.TestAllImplementations(t, "crypto/sha256", testGolden)
+}
+
+func testGolden(t *testing.T) {
+	for _, g := range golden {
 		s := fmt.Sprintf("%x", Sum256([]byte(g.in)))
 		if s != g.out {
 			t.Fatalf("Sum256 function: sha256(%s) = %s want %s", g.in, s, g.out)
@@ -102,7 +107,7 @@ func TestGolden(t *testing.T) {
 			if j < 2 {
 				io.WriteString(c, g.in)
 			} else {
-				io.WriteString(c, g.in[0:len(g.in)/2])
+				io.WriteString(c, g.in[:len(g.in)/2])
 				c.Sum(nil)
 				io.WriteString(c, g.in[len(g.in)/2:])
 			}
@@ -113,8 +118,7 @@ func TestGolden(t *testing.T) {
 			c.Reset()
 		}
 	}
-	for i := 0; i < len(golden224); i++ {
-		g := golden224[i]
+	for _, g := range golden224 {
 		s := fmt.Sprintf("%x", Sum224([]byte(g.in)))
 		if s != g.out {
 			t.Fatalf("Sum224 function: sha224(%s) = %s want %s", g.in, s, g.out)
@@ -124,7 +128,7 @@ func TestGolden(t *testing.T) {
 			if j < 2 {
 				io.WriteString(c, g.in)
 			} else {
-				io.WriteString(c, g.in[0:len(g.in)/2])
+				io.WriteString(c, g.in[:len(g.in)/2])
 				c.Sum(nil)
 				io.WriteString(c, g.in[len(g.in)/2:])
 			}
@@ -138,6 +142,10 @@ func TestGolden(t *testing.T) {
 }
 
 func TestGoldenMarshal(t *testing.T) {
+	cryptotest.TestAllImplementations(t, "crypto/sha256", testGoldenMarshal)
+}
+
+func testGoldenMarshal(t *testing.T) {
 	tests := []struct {
 		name    string
 		newHash func() hash.Hash
@@ -161,8 +169,20 @@ func TestGoldenMarshal(t *testing.T) {
 					continue
 				}
 
+				stateAppend, err := h.(encoding.BinaryAppender).AppendBinary(make([]byte, 4, 32))
+				if err != nil {
+					t.Errorf("could not marshal: %v", err)
+					continue
+				}
+				stateAppend = stateAppend[4:]
+
 				if string(state) != g.halfState {
 					t.Errorf("sha%s(%q) state = %q, want %q", tt.name, g.in, state, g.halfState)
+					continue
+				}
+
+				if string(stateAppend) != g.halfState {
+					t.Errorf("sha%s(%q) stateAppend = %q, want %q", tt.name, g.in, stateAppend, g.halfState)
 					continue
 				}
 
@@ -211,18 +231,6 @@ func TestBlockSize(t *testing.T) {
 	c := New()
 	if got := c.BlockSize(); got != BlockSize {
 		t.Errorf("BlockSize = %d want %d", got, BlockSize)
-	}
-}
-
-// Tests that blockGeneric (pure Go) and block (in assembly for some architectures) match.
-func TestBlockGeneric(t *testing.T) {
-	gen, asm := New().(*digest), New().(*digest)
-	buf := make([]byte, BlockSize*20) // arbitrary factor
-	rand.Read(buf)
-	blockGeneric(gen, buf)
-	block(asm, buf)
-	if *gen != *asm {
-		t.Error("block and blockGeneric resulted in different states")
 	}
 }
 
@@ -290,30 +298,90 @@ func TestLargeHashes(t *testing.T) {
 }
 
 func TestAllocations(t *testing.T) {
-	in := []byte("hello, world!")
-	out := make([]byte, 0, Size)
-	h := New()
-	n := int(testing.AllocsPerRun(10, func() {
-		h.Reset()
-		h.Write(in)
-		out = h.Sum(out[:0])
-	}))
-	if n > 0 {
-		t.Errorf("allocs = %d, want 0", n)
+	testenv.SkipIfOptimizationOff(t)
+	if boring.Enabled {
+		t.Skip("BoringCrypto doesn't allocate the same way as stdlib")
 	}
+	if n := testing.AllocsPerRun(10, func() {
+		in := []byte("hello, world!")
+		out := make([]byte, 0, Size)
+
+		{
+			h := New()
+			h.Reset()
+			h.Write(in)
+			out = h.Sum(out[:0])
+		}
+		{
+			h := New224()
+			h.Reset()
+			h.Write(in)
+			out = h.Sum(out[:0])
+		}
+
+		Sum256(in)
+		Sum224(in)
+	}); n > 0 {
+		t.Errorf("allocs = %v, want 0", n)
+	}
+}
+
+type cgoData struct {
+	Data [16]byte
+	Ptr  *cgoData
+}
+
+func TestCgo(t *testing.T) {
+	// Test that Write does not cause cgo to scan the entire cgoData struct for pointers.
+	// The scan (if any) should be limited to the [16]byte.
+	d := new(cgoData)
+	d.Ptr = d
+	h := New()
+	h.Write(d.Data[:])
+	h.Sum(nil)
+}
+
+func TestHash(t *testing.T) {
+	t.Run("SHA-224", func(t *testing.T) {
+		cryptotest.TestAllImplementations(t, "crypto/sha256", func(t *testing.T) {
+			cryptotest.TestHash(t, New224)
+		})
+	})
+	t.Run("SHA-256", func(t *testing.T) {
+		cryptotest.TestAllImplementations(t, "crypto/sha256", func(t *testing.T) {
+			cryptotest.TestHash(t, New)
+		})
+	})
 }
 
 var bench = New()
 var buf = make([]byte, 8192)
 
 func benchmarkSize(b *testing.B, size int) {
-	b.SetBytes(int64(size))
 	sum := make([]byte, bench.Size())
-	for i := 0; i < b.N; i++ {
-		bench.Reset()
-		bench.Write(buf[:size])
-		bench.Sum(sum[:0])
-	}
+	b.Run("New", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(size))
+		for i := 0; i < b.N; i++ {
+			bench.Reset()
+			bench.Write(buf[:size])
+			bench.Sum(sum[:0])
+		}
+	})
+	b.Run("Sum224", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(size))
+		for i := 0; i < b.N; i++ {
+			Sum224(buf[:size])
+		}
+	})
+	b.Run("Sum256", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(size))
+		for i := 0; i < b.N; i++ {
+			Sum256(buf[:size])
+		}
+	})
 }
 
 func BenchmarkHash8Bytes(b *testing.B) {

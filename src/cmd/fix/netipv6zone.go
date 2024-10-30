@@ -4,7 +4,10 @@
 
 package main
 
-import "go/ast"
+import (
+	"go/ast"
+	"slices"
+)
 
 func init() {
 	register(netipv6zoneFix)
@@ -26,7 +29,7 @@ func netipv6zone(f *ast.File) bool {
 	}
 
 	fixed := false
-	walk(f, func(n interface{}) {
+	walk(f, func(n any) {
 		cl, ok := n.(*ast.CompositeLit)
 		if !ok {
 			return
@@ -52,7 +55,7 @@ func netipv6zone(f *ast.File) bool {
 					}
 				case 1:
 					if elit, ok := e.(*ast.BasicLit); ok && elit.Value == "0" {
-						cl.Elts = append(cl.Elts[:i], cl.Elts[i+1:]...)
+						cl.Elts = slices.Delete(cl.Elts, i, i+1)
 					} else {
 						cl.Elts[i] = &ast.KeyValueExpr{
 							Key:   ast.NewIdent("Port"),

@@ -20,20 +20,6 @@ type fix struct {
 	disabled bool // whether this fix should be disabled by default
 }
 
-// main runs sort.Sort(byName(fixes)) before printing list of fixes.
-type byName []fix
-
-func (f byName) Len() int           { return len(f) }
-func (f byName) Swap(i, j int)      { f[i], f[j] = f[j], f[i] }
-func (f byName) Less(i, j int) bool { return f[i].name < f[j].name }
-
-// main runs sort.Sort(byDate(fixes)) before applying fixes.
-type byDate []fix
-
-func (f byDate) Len() int           { return len(f) }
-func (f byDate) Swap(i, j int)      { f[i], f[j] = f[j], f[i] }
-func (f byDate) Less(i, j int) bool { return f[i].date < f[j].date }
-
 var fixes []fix
 
 func register(f fix) {
@@ -43,15 +29,15 @@ func register(f fix) {
 // walk traverses the AST x, calling visit(y) for each node y in the tree but
 // also with a pointer to each ast.Expr, ast.Stmt, and *ast.BlockStmt,
 // in a bottom-up traversal.
-func walk(x interface{}, visit func(interface{})) {
+func walk(x any, visit func(any)) {
 	walkBeforeAfter(x, nop, visit)
 }
 
-func nop(interface{}) {}
+func nop(any) {}
 
 // walkBeforeAfter is like walk but calls before(x) before traversing
 // x's children and after(x) afterward.
-func walkBeforeAfter(x interface{}, before, after func(interface{})) {
+func walkBeforeAfter(x any, before, after func(any)) {
 	before(x)
 
 	switch n := x.(type) {
@@ -390,7 +376,7 @@ func renameTop(f *ast.File, old, new string) bool {
 	// Rename top-level old to new, both unresolved names
 	// (probably defined in another file) and names that resolve
 	// to a declaration we renamed.
-	walk(f, func(n interface{}) {
+	walk(f, func(n any) {
 		id, ok := n.(*ast.Ident)
 		if ok && isTopName(id, old) {
 			id.Name = new

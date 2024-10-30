@@ -49,7 +49,7 @@ type T struct {
 	MSI      map[string]int
 	MSIone   map[string]int // one element, for deterministic output
 	MSIEmpty map[string]int
-	MXI      map[interface{}]int
+	MXI      map[any]int
 	MII      map[int]int
 	MI32S    map[int32]string
 	MI64S    map[int64]string
@@ -59,11 +59,11 @@ type T struct {
 	MUI8S    map[uint8]string
 	SMSI     []map[string]int
 	// Empty interfaces; used to see if we can dig inside one.
-	Empty0 interface{} // nil
-	Empty1 interface{}
-	Empty2 interface{}
-	Empty3 interface{}
-	Empty4 interface{}
+	Empty0 any // nil
+	Empty1 any
+	Empty2 any
+	Empty3 any
+	Empty4 any
 	// Non-empty interfaces.
 	NonEmptyInterface         I
 	NonEmptyInterfacePtS      *I
@@ -141,7 +141,7 @@ var tVal = &T{
 	SB:     []bool{true, false},
 	MSI:    map[string]int{"one": 1, "two": 2, "three": 3},
 	MSIone: map[string]int{"one": 1},
-	MXI:    map[interface{}]int{"one": 1},
+	MXI:    map[any]int{"one": 1},
 	MII:    map[int]int{1: 1},
 	MI32S:  map[int32]string{1: "one", 2: "two"},
 	MI64S:  map[int64]string{2: "i642", 3: "i643"},
@@ -212,7 +212,7 @@ func (t *T) Method2(a uint16, b string) string {
 	return fmt.Sprintf("Method2: %d %s", a, b)
 }
 
-func (t *T) Method3(v interface{}) string {
+func (t *T) Method3(v any) string {
 	return fmt.Sprintf("Method3: %v", v)
 }
 
@@ -252,7 +252,7 @@ func (u *U) TrueFalse(b bool) string {
 	return ""
 }
 
-func typeOf(arg interface{}) string {
+func typeOf(arg any) string {
 	return fmt.Sprintf("%T", arg)
 }
 
@@ -260,7 +260,7 @@ type execTest struct {
 	name   string
 	input  string
 	output string
-	data   interface{}
+	data   any
 	ok     bool
 }
 
@@ -268,8 +268,8 @@ type execTest struct {
 // of the max int boundary.
 // We do it this way so the test doesn't depend on ints being 32 bits.
 var (
-	bigInt  = fmt.Sprintf("0x%x", int(1<<uint(reflect.TypeOf(0).Bits()-1)-1))
-	bigUint = fmt.Sprintf("0x%x", uint(1<<uint(reflect.TypeOf(0).Bits()-1)))
+	bigInt  = fmt.Sprintf("0x%x", int(1<<uint(reflect.TypeFor[int]().Bits()-1)-1))
+	bigUint = fmt.Sprintf("0x%x", uint(1<<uint(reflect.TypeFor[int]().Bits()-1)))
 )
 
 var execTests = []execTest{
@@ -393,7 +393,7 @@ var execTests = []execTest{
 	{".VariadicFuncInt", "{{call .VariadicFuncInt 33 `he` `llo`}}", "33=&lt;he&#43;llo&gt;", tVal, true},
 	{"if .BinaryFunc call", "{{ if .BinaryFunc}}{{call .BinaryFunc `1` `2`}}{{end}}", "[1=2]", tVal, true},
 	{"if not .BinaryFunc call", "{{ if not .BinaryFunc}}{{call .BinaryFunc `1` `2`}}{{else}}No{{end}}", "No", tVal, true},
-	{"Interface Call", `{{stringer .S}}`, "foozle", map[string]interface{}{"S": bytes.NewBufferString("foozle")}, true},
+	{"Interface Call", `{{stringer .S}}`, "foozle", map[string]any{"S": bytes.NewBufferString("foozle")}, true},
 	{".ErrFunc", "{{call .ErrFunc}}", "bla", tVal, true},
 	{"call nil", "{{call nil}}", "", tVal, false},
 
@@ -561,6 +561,8 @@ var execTests = []execTest{
 	{"with $x struct.U.V", "{{with $x := $}}{{$x.U.V}}{{end}}", "v", tVal, true},
 	{"with variable and action", "{{with $x := $}}{{$y := $.U.V}}{{$y}}{{end}}", "v", tVal, true},
 	{"with on typed nil interface value", "{{with .NonEmptyInterfaceTypedNil}}TRUE{{ end }}", "", tVal, true},
+	{"with else with", "{{with 0}}{{.}}{{else with true}}{{.}}{{end}}", "true", tVal, true},
+	{"with else with chain", "{{with 0}}{{.}}{{else with false}}{{.}}{{else with `notempty`}}{{.}}{{end}}", "notempty", tVal, true},
 
 	// Range.
 	{"range []int", "{{range .SI}}-{{.}}-{{end}}", "-3--4--5-", tVal, true},
@@ -740,7 +742,7 @@ func add(args ...int) int {
 	return sum
 }
 
-func echo(arg interface{}) interface{} {
+func echo(arg any) any {
 	return arg
 }
 
@@ -759,12 +761,12 @@ func stringer(s fmt.Stringer) string {
 	return s.String()
 }
 
-func mapOfThree() interface{} {
+func mapOfThree() any {
 	return map[string]int{"three": 3}
 }
 
 func testExecute(execTests []execTest, template *Template, t *testing.T) {
-	b := new(bytes.Buffer)
+	b := new(strings.Builder)
 	funcs := FuncMap{
 		"add":         add,
 		"count":       count,
@@ -856,7 +858,7 @@ func TestDelims(t *testing.T) {
 		if err != nil {
 			t.Fatalf("delim %q text %q parse err %s", left, text, err)
 		}
-		var b = new(bytes.Buffer)
+		var b = new(strings.Builder)
 		err = tmpl.Execute(b, value)
 		if err != nil {
 			t.Fatalf("delim %q exec err %s", left, err)
@@ -920,7 +922,7 @@ func TestJSEscaping(t *testing.T) {
 		{`'foo`, `\'foo`},
 		{`Go "jump" \`, `Go \"jump\" \\`},
 		{`Yukihiro says "今日は世界"`, `Yukihiro says \"今日は世界\"`},
-		{"unprintable \uFDFF", `unprintable \uFDFF`},
+		{"unprintable \uFFFE", `unprintable \uFFFE`},
 		{`<html>`, `\u003Chtml\u003E`},
 		{`no = in attributes`, `no \u003D in attributes`},
 		{`&#x27; does not become HTML entity`, `\u0026#x27; does not become HTML entity`},
@@ -997,7 +999,7 @@ func TestTree(t *testing.T) {
 	if err != nil {
 		t.Fatal("parse error:", err)
 	}
-	var b bytes.Buffer
+	var b strings.Builder
 	const expect = "[1[2[3[4]][5[6]]][7[8[9]][10[11]]]]"
 	// First by looking up the template.
 	err = tmpl.Lookup("tree").Execute(&b, tree)
@@ -1191,33 +1193,39 @@ var cmpTests = []cmpTest{
 	{"eq .Iface1 .Iface1", "true", true},
 	{"eq .Iface1 .Iface2", "false", true},
 	{"eq .Iface2 .Iface2", "true", true},
+	{"eq .Map .Map", "true", true},        // Uncomparable types but nil is OK.
+	{"eq .Map nil", "true", true},         // Uncomparable types but nil is OK.
+	{"eq nil .Map", "true", true},         // Uncomparable types but nil is OK.
+	{"eq .Map .NonNilMap", "false", true}, // Uncomparable types but nil is OK.
 	// Errors
-	{"eq `xy` 1", "", false},       // Different types.
-	{"eq 2 2.0", "", false},        // Different types.
-	{"lt true true", "", false},    // Unordered types.
-	{"lt 1+0i 1+0i", "", false},    // Unordered types.
-	{"eq .Ptr 1", "", false},       // Incompatible types.
-	{"eq .Ptr .NegOne", "", false}, // Incompatible types.
-	{"eq .Map .Map", "", false},    // Uncomparable types.
-	{"eq .Map .V1", "", false},     // Uncomparable types.
+	{"eq `xy` 1", "", false},                // Different types.
+	{"eq 2 2.0", "", false},                 // Different types.
+	{"lt true true", "", false},             // Unordered types.
+	{"lt 1+0i 1+0i", "", false},             // Unordered types.
+	{"eq .Ptr 1", "", false},                // Incompatible types.
+	{"eq .Ptr .NegOne", "", false},          // Incompatible types.
+	{"eq .Map .V1", "", false},              // Uncomparable types.
+	{"eq .NonNilMap .NonNilMap", "", false}, // Uncomparable types.
 }
 
 func TestComparison(t *testing.T) {
-	b := new(bytes.Buffer)
+	b := new(strings.Builder)
 	var cmpStruct = struct {
 		Uthree, Ufour  uint
 		NegOne, Three  int
 		Ptr, NilPtr    *int
+		NonNilMap      map[int]int
 		Map            map[int]int
 		V1, V2         V
 		Iface1, Iface2 fmt.Stringer
 	}{
-		Uthree: 3,
-		Ufour:  4,
-		NegOne: -1,
-		Three:  3,
-		Ptr:    new(int),
-		Iface1: b,
+		Uthree:    3,
+		Ufour:     4,
+		NegOne:    -1,
+		Three:     3,
+		Ptr:       new(int),
+		NonNilMap: make(map[int]int),
+		Iface1:    b,
 	}
 	for _, test := range cmpTests {
 		text := fmt.Sprintf("{{if %s}}true{{else}}false{{end}}", test.expr)
@@ -1249,7 +1257,7 @@ func TestMissingMapKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var b bytes.Buffer
+	var b strings.Builder
 	// By default, just get "<no value>" // NOTE: not in html/template, get empty string
 	err = tmpl.Execute(&b, data)
 	if err != nil {
@@ -1418,7 +1426,7 @@ func TestBlock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var buf bytes.Buffer
+	var buf strings.Builder
 	if err := tmpl.Execute(&buf, "hello"); err != nil {
 		t.Fatal(err)
 	}
@@ -1438,7 +1446,7 @@ func TestBlock(t *testing.T) {
 func TestEvalFieldErrors(t *testing.T) {
 	tests := []struct {
 		name, src string
-		value     interface{}
+		value     any
 		want      string
 	}{
 		{
@@ -1524,7 +1532,7 @@ func TestAddrOfIndex(t *testing.T) {
 	}
 	for _, text := range texts {
 		tmpl := Must(New("tmpl").Parse(text))
-		var buf bytes.Buffer
+		var buf strings.Builder
 		err := tmpl.Execute(&buf, reflect.ValueOf([]V{{1}}))
 		if err != nil {
 			t.Fatalf("%s: Execute: %v", text, err)
@@ -1580,8 +1588,8 @@ func TestInterfaceValues(t *testing.T) {
 
 	for _, tt := range tests {
 		tmpl := Must(New("tmpl").Parse(tt.text))
-		var buf bytes.Buffer
-		err := tmpl.Execute(&buf, map[string]interface{}{
+		var buf strings.Builder
+		err := tmpl.Execute(&buf, map[string]any{
 			"PlusOne": func(n int) int {
 				return n + 1
 			},
@@ -1610,7 +1618,7 @@ func TestInterfaceValues(t *testing.T) {
 
 // Check that panics during calls are recovered and returned as errors.
 func TestExecutePanicDuringCall(t *testing.T) {
-	funcs := map[string]interface{}{
+	funcs := map[string]any{
 		"doPanic": func() string {
 			panic("custom panic string")
 		},
@@ -1618,7 +1626,7 @@ func TestExecutePanicDuringCall(t *testing.T) {
 	tests := []struct {
 		name    string
 		input   string
-		data    interface{}
+		data    any
 		wantErr string
 	}{
 		{
@@ -1675,7 +1683,7 @@ func TestIssue31810(t *testing.T) {
 	t.Skip("broken in html/template")
 
 	// A simple value with no arguments is fine.
-	var b bytes.Buffer
+	var b strings.Builder
 	const text = "{{ (.)  }}"
 	tmpl, err := New("").Parse(text)
 	if err != nil {
@@ -1816,7 +1824,7 @@ func TestRecursiveExecuteViaMethod(t *testing.T) {
 func TestTemplateFuncsAfterClone(t *testing.T) {
 	s := `{{ f . }}`
 	want := "test"
-	orig := New("orig").Funcs(map[string]interface{}{
+	orig := New("orig").Funcs(map[string]any{
 		"f": func(in string) string {
 			return in
 		},

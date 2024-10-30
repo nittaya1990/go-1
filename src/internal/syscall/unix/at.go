@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build linux || openbsd || netbsd || dragonfly
+//go:build dragonfly || freebsd || linux || netbsd || (openbsd && mips64)
 
 package unix
 
@@ -12,7 +12,6 @@ import (
 )
 
 func Unlinkat(dirfd int, path string, flags int) error {
-	var p *byte
 	p, err := syscall.BytePtrFromString(path)
 	if err != nil {
 		return err
@@ -27,7 +26,6 @@ func Unlinkat(dirfd int, path string, flags int) error {
 }
 
 func Openat(dirfd int, path string, flags int, perm uint32) (int, error) {
-	var p *byte
 	p, err := syscall.BytePtrFromString(path)
 	if err != nil {
 		return 0, err
@@ -41,18 +39,43 @@ func Openat(dirfd int, path string, flags int, perm uint32) (int, error) {
 	return int(fd), nil
 }
 
-func Fstatat(dirfd int, path string, stat *syscall.Stat_t, flags int) error {
-	var p *byte
+func Readlinkat(dirfd int, path string, buf []byte) (int, error) {
+	p0, err := syscall.BytePtrFromString(path)
+	if err != nil {
+		return 0, err
+	}
+	var p1 unsafe.Pointer
+	if len(buf) > 0 {
+		p1 = unsafe.Pointer(&buf[0])
+	} else {
+		p1 = unsafe.Pointer(&_zero)
+	}
+	n, _, errno := syscall.Syscall6(readlinkatTrap,
+		uintptr(dirfd),
+		uintptr(unsafe.Pointer(p0)),
+		uintptr(p1),
+		uintptr(len(buf)),
+		0, 0)
+	if errno != 0 {
+		return 0, errno
+	}
+
+	return int(n), nil
+}
+
+func Mkdirat(dirfd int, path string, mode uint32) error {
 	p, err := syscall.BytePtrFromString(path)
 	if err != nil {
 		return err
 	}
 
-	_, _, errno := syscall.Syscall6(fstatatTrap, uintptr(dirfd), uintptr(unsafe.Pointer(p)), uintptr(unsafe.Pointer(stat)), uintptr(flags), 0, 0)
+	_, _, errno := syscall.Syscall6(mkdiratTrap,
+		uintptr(dirfd),
+		uintptr(unsafe.Pointer(p)),
+		uintptr(mode),
+		0, 0, 0)
 	if errno != 0 {
 		return errno
 	}
-
 	return nil
-
 }

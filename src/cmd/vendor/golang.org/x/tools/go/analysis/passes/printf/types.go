@@ -10,6 +10,7 @@ import (
 	"go/types"
 
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/internal/aliases"
 	"golang.org/x/tools/internal/typeparams"
 )
 
@@ -72,7 +73,7 @@ func (m *argMatcher) match(typ types.Type, topLevel bool) bool {
 		return true
 	}
 
-	if typ, _ := typ.(*typeparams.TypeParam); typ != nil {
+	if typ, _ := aliases.Unalias(typ).(*types.TypeParam); typ != nil {
 		// Avoid infinite recursion through type parameters.
 		if m.seen[typ] {
 			return true
@@ -178,10 +179,12 @@ func (m *argMatcher) match(typ types.Type, topLevel bool) bool {
 			return true
 		}
 
+		if typeparams.IsTypeParam(typ.Elem()) {
+			return true // We don't know whether the logic below applies. Give up.
+		}
+
 		under := typ.Elem().Underlying()
 		switch under.(type) {
-		case *typeparams.TypeParam:
-			return true // We don't know whether the logic below applies. Give up.
 		case *types.Struct: // see below
 		case *types.Array: // see below
 		case *types.Slice: // see below
@@ -273,7 +276,7 @@ func (m *argMatcher) match(typ types.Type, topLevel bool) bool {
 }
 
 func isConvertibleToString(typ types.Type) bool {
-	if bt, ok := typ.(*types.Basic); ok && bt.Kind() == types.UntypedNil {
+	if bt, ok := aliases.Unalias(typ).(*types.Basic); ok && bt.Kind() == types.UntypedNil {
 		// We explicitly don't want untyped nil, which is
 		// convertible to both of the interfaces below, as it
 		// would just panic anyway.
@@ -296,14 +299,4 @@ func isConvertibleToString(typ types.Type) bool {
 	}
 
 	return false
-}
-
-// hasBasicType reports whether x's type is a types.Basic with the given kind.
-func hasBasicType(pass *analysis.Pass, x ast.Expr, kind types.BasicKind) bool {
-	t := pass.TypesInfo.Types[x].Type
-	if t != nil {
-		t = t.Underlying()
-	}
-	b, ok := t.(*types.Basic)
-	return ok && b.Kind() == kind
 }

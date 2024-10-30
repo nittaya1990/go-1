@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"reflect"
+	"strconv"
 	"sync"
 	"unicode/utf8"
 )
@@ -33,7 +34,7 @@ const (
 )
 
 // State represents the printer state passed to custom formatters.
-// It provides access to the io.Writer interface plus information about
+// It provides access to the [io.Writer] interface plus information about
 // the flags and options for the operand's format specifier.
 type State interface {
 	// Write is the function to call to emit formatted output to be printed.
@@ -48,17 +49,17 @@ type State interface {
 }
 
 // Formatter is implemented by any value that has a Format method.
-// The implementation controls how State and rune are interpreted,
-// and may call Sprint(f) or Fprint(f) etc. to generate its output.
+// The implementation controls how [State] and rune are interpreted,
+// and may call [Sprint] or [Fprint](f) etc. to generate its output.
 type Formatter interface {
 	Format(f State, verb rune)
 }
 
 // Stringer is implemented by any value that has a String method,
-// which defines the ``native'' format for that value.
+// which defines the “native” format for that value.
 // The String method is used to print values passed as an operand
 // to any format that accepts a string or to an unformatted printer
-// such as Print.
+// such as [Print].
 type Stringer interface {
 	String() string
 }
@@ -69,6 +70,31 @@ type Stringer interface {
 // to a %#v format.
 type GoStringer interface {
 	GoString() string
+}
+
+// FormatString returns a string representing the fully qualified formatting
+// directive captured by the [State], followed by the argument verb. ([State] does not
+// itself contain the verb.) The result has a leading percent sign followed by any
+// flags, the width, and the precision. Missing flags, width, and precision are
+// omitted. This function allows a [Formatter] to reconstruct the original
+// directive triggering the call to Format.
+func FormatString(state State, verb rune) string {
+	var tmp [16]byte // Use a local buffer.
+	b := append(tmp[:0], '%')
+	for _, c := range " +-#0" { // All known flags
+		if state.Flag(int(c)) { // The argument is an int for historical reasons.
+			b = append(b, byte(c))
+		}
+	}
+	if w, ok := state.Width(); ok {
+		b = strconv.AppendInt(b, int64(w), 10)
+	}
+	if p, ok := state.Precision(); ok {
+		b = append(b, '.')
+		b = strconv.AppendInt(b, int64(p), 10)
+	}
+	b = utf8.AppendRune(b, verb)
+	return string(b)
 }
 
 // Use simple []byte instead of bytes.Buffer to avoid large dependency.
@@ -86,19 +112,8 @@ func (b *buffer) writeByte(c byte) {
 	*b = append(*b, c)
 }
 
-func (bp *buffer) writeRune(r rune) {
-	if r < utf8.RuneSelf {
-		*bp = append(*bp, byte(r))
-		return
-	}
-
-	b := *bp
-	n := len(b)
-	for n+utf8.UTFMax > cap(b) {
-		b = append(b, 0)
-	}
-	w := utf8.EncodeRune(b[n:n+utf8.UTFMax], r)
-	*bp = b[:n+w]
+func (b *buffer) writeRune(r rune) {
+	*b = utf8.AppendRune(*b, r)
 }
 
 // pp is used to store a printer's state and is reused with sync.Pool to avoid allocations.
@@ -106,7 +121,7 @@ type pp struct {
 	buf buffer
 
 	// arg holds the current item, as an interface{}.
-	arg interface{}
+	arg any
 
 	// value is used instead of arg for reflect values.
 	value reflect.Value
@@ -124,12 +139,12 @@ type pp struct {
 	erroring bool
 	// wrapErrs is set when the format string may contain a %w verb.
 	wrapErrs bool
-	// wrappedErr records the target of the %w verb.
-	wrappedErr error
+	// wrappedErrs records the targets of the %w verb.
+	wrappedErrs []int
 }
 
 var ppFree = sync.Pool{
-	New: func() interface{} { return new(pp) },
+	New: func() any { return new(pp) },
 }
 
 // newPrinter allocates a new pp struct or grabs a cached one.
@@ -146,18 +161,23 @@ func newPrinter() *pp {
 func (p *pp) free() {
 	// Proper usage of a sync.Pool requires each entry to have approximately
 	// the same memory cost. To obtain this property when the stored type
-	// contains a variably-sized buffer, we add a hard limit on the maximum buffer
-	// to place back in the pool.
+	// contains a variably-sized buffer, we add a hard limit on the maximum
+	// buffer to place back in the pool. If the buffer is larger than the
+	// limit, we drop the buffer and recycle just the printer.
 	//
-	// See https://golang.org/issue/23199
-	if cap(p.buf) > 64<<10 {
-		return
+	// See https://golang.org/issue/23199.
+	if cap(p.buf) > 64*1024 {
+		p.buf = nil
+	} else {
+		p.buf = p.buf[:0]
+	}
+	if cap(p.wrappedErrs) > 8 {
+		p.wrappedErrs = nil
 	}
 
-	p.buf = p.buf[:0]
 	p.arg = nil
 	p.value = reflect.Value{}
-	p.wrappedErr = nil
+	p.wrappedErrs = p.wrappedErrs[:0]
 	ppFree.Put(p)
 }
 
@@ -181,14 +201,14 @@ func (p *pp) Flag(b int) bool {
 	return false
 }
 
-// Implement Write so we can call Fprintf on a pp (through State), for
+// Write implements [io.Writer] so we can call [Fprintf] on a pp (through [State]), for
 // recursive use in custom verbs.
 func (p *pp) Write(b []byte) (ret int, err error) {
 	p.buf.write(b)
 	return len(b), nil
 }
 
-// Implement WriteString so that we can call io.WriteString
+// WriteString implements [io.StringWriter] so that we can call [io.WriteString]
 // on a pp (through state), for efficiency.
 func (p *pp) WriteString(s string) (ret int, err error) {
 	p.buf.writeString(s)
@@ -199,7 +219,7 @@ func (p *pp) WriteString(s string) (ret int, err error) {
 
 // Fprintf formats according to a format specifier and writes to w.
 // It returns the number of bytes written and any write error encountered.
-func Fprintf(w io.Writer, format string, a ...interface{}) (n int, err error) {
+func Fprintf(w io.Writer, format string, a ...any) (n int, err error) {
 	p := newPrinter()
 	p.doPrintf(format, a)
 	n, err = w.Write(p.buf)
@@ -209,12 +229,12 @@ func Fprintf(w io.Writer, format string, a ...interface{}) (n int, err error) {
 
 // Printf formats according to a format specifier and writes to standard output.
 // It returns the number of bytes written and any write error encountered.
-func Printf(format string, a ...interface{}) (n int, err error) {
+func Printf(format string, a ...any) (n int, err error) {
 	return Fprintf(os.Stdout, format, a...)
 }
 
 // Sprintf formats according to a format specifier and returns the resulting string.
-func Sprintf(format string, a ...interface{}) string {
+func Sprintf(format string, a ...any) string {
 	p := newPrinter()
 	p.doPrintf(format, a)
 	s := string(p.buf)
@@ -222,12 +242,22 @@ func Sprintf(format string, a ...interface{}) string {
 	return s
 }
 
+// Appendf formats according to a format specifier, appends the result to the byte
+// slice, and returns the updated slice.
+func Appendf(b []byte, format string, a ...any) []byte {
+	p := newPrinter()
+	p.doPrintf(format, a)
+	b = append(b, p.buf...)
+	p.free()
+	return b
+}
+
 // These routines do not take a format string
 
 // Fprint formats using the default formats for its operands and writes to w.
 // Spaces are added between operands when neither is a string.
 // It returns the number of bytes written and any write error encountered.
-func Fprint(w io.Writer, a ...interface{}) (n int, err error) {
+func Fprint(w io.Writer, a ...any) (n int, err error) {
 	p := newPrinter()
 	p.doPrint(a)
 	n, err = w.Write(p.buf)
@@ -238,18 +268,28 @@ func Fprint(w io.Writer, a ...interface{}) (n int, err error) {
 // Print formats using the default formats for its operands and writes to standard output.
 // Spaces are added between operands when neither is a string.
 // It returns the number of bytes written and any write error encountered.
-func Print(a ...interface{}) (n int, err error) {
+func Print(a ...any) (n int, err error) {
 	return Fprint(os.Stdout, a...)
 }
 
 // Sprint formats using the default formats for its operands and returns the resulting string.
 // Spaces are added between operands when neither is a string.
-func Sprint(a ...interface{}) string {
+func Sprint(a ...any) string {
 	p := newPrinter()
 	p.doPrint(a)
 	s := string(p.buf)
 	p.free()
 	return s
+}
+
+// Append formats using the default formats for its operands, appends the result to
+// the byte slice, and returns the updated slice.
+func Append(b []byte, a ...any) []byte {
+	p := newPrinter()
+	p.doPrint(a)
+	b = append(b, p.buf...)
+	p.free()
+	return b
 }
 
 // These routines end in 'ln', do not take a format string,
@@ -259,7 +299,7 @@ func Sprint(a ...interface{}) string {
 // Fprintln formats using the default formats for its operands and writes to w.
 // Spaces are always added between operands and a newline is appended.
 // It returns the number of bytes written and any write error encountered.
-func Fprintln(w io.Writer, a ...interface{}) (n int, err error) {
+func Fprintln(w io.Writer, a ...any) (n int, err error) {
 	p := newPrinter()
 	p.doPrintln(a)
 	n, err = w.Write(p.buf)
@@ -270,13 +310,13 @@ func Fprintln(w io.Writer, a ...interface{}) (n int, err error) {
 // Println formats using the default formats for its operands and writes to standard output.
 // Spaces are always added between operands and a newline is appended.
 // It returns the number of bytes written and any write error encountered.
-func Println(a ...interface{}) (n int, err error) {
+func Println(a ...any) (n int, err error) {
 	return Fprintln(os.Stdout, a...)
 }
 
 // Sprintln formats using the default formats for its operands and returns the resulting string.
 // Spaces are always added between operands and a newline is appended.
-func Sprintln(a ...interface{}) string {
+func Sprintln(a ...any) string {
 	p := newPrinter()
 	p.doPrintln(a)
 	s := string(p.buf)
@@ -284,8 +324,19 @@ func Sprintln(a ...interface{}) string {
 	return s
 }
 
+// Appendln formats using the default formats for its operands, appends the result
+// to the byte slice, and returns the updated slice. Spaces are always added
+// between operands and a newline is appended.
+func Appendln(b []byte, a ...any) []byte {
+	p := newPrinter()
+	p.doPrintln(a)
+	b = append(b, p.buf...)
+	p.free()
+	return b
+}
+
 // getField gets the i'th field of the struct value.
-// If the field is itself is an interface, return a value for
+// If the field itself is a non-nil interface, return a value for
 // the thing inside the interface, not the interface itself.
 func getField(v reflect.Value, i int) reflect.Value {
 	val := v.Field(i)
@@ -499,7 +550,7 @@ func (p *pp) fmtPointer(value reflect.Value, verb rune) {
 	var u uintptr
 	switch value.Kind() {
 	case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
-		u = value.Pointer()
+		u = uintptr(value.UnsafePointer())
 	default:
 		p.badVerb(verb)
 		return
@@ -533,7 +584,7 @@ func (p *pp) fmtPointer(value reflect.Value, verb rune) {
 	}
 }
 
-func (p *pp) catchPanic(arg interface{}, verb rune, method string) {
+func (p *pp) catchPanic(arg any, verb rune, method string) {
 	if err := recover(); err != nil {
 		// If it's a nil pointer, just say "<nil>". The likeliest causes are a
 		// Stringer that fails to guard against nil or a nil pointer for a
@@ -572,16 +623,12 @@ func (p *pp) handleMethods(verb rune) (handled bool) {
 		return
 	}
 	if verb == 'w' {
-		// It is invalid to use %w other than with Errorf, more than once,
-		// or with a non-error arg.
-		err, ok := p.arg.(error)
-		if !ok || !p.wrapErrs || p.wrappedErr != nil {
-			p.wrappedErr = nil
-			p.wrapErrs = false
+		// It is invalid to use %w other than with Errorf or with a non-error arg.
+		_, ok := p.arg.(error)
+		if !ok || !p.wrapErrs {
 			p.badVerb(verb)
 			return true
 		}
-		p.wrappedErr = err
 		// If the arg is a Formatter, pass 'v' as the verb to it.
 		verb = 'v'
 	}
@@ -631,7 +678,7 @@ func (p *pp) handleMethods(verb rune) (handled bool) {
 	return false
 }
 
-func (p *pp) printArg(arg interface{}, verb rune) {
+func (p *pp) printArg(arg any, verb rune) {
 	p.arg = arg
 	p.value = reflect.Value{}
 
@@ -767,7 +814,7 @@ func (p *pp) printValue(value reflect.Value, verb rune, depth int) {
 			p.buf.writeString(mapString)
 		}
 		sorted := fmtsort.Sort(f)
-		for i, key := range sorted.Key {
+		for i, m := range sorted {
 			if i > 0 {
 				if p.fmt.sharpV {
 					p.buf.writeString(commaSpaceString)
@@ -775,9 +822,9 @@ func (p *pp) printValue(value reflect.Value, verb rune, depth int) {
 					p.buf.writeByte(' ')
 				}
 			}
-			p.printValue(key, verb, depth+1)
+			p.printValue(m.Key, verb, depth+1)
 			p.buf.writeByte(':')
-			p.printValue(sorted.Value[i], verb, depth+1)
+			p.printValue(m.Value, verb, depth+1)
 		}
 		if p.fmt.sharpV {
 			p.buf.writeByte('}')
@@ -825,12 +872,10 @@ func (p *pp) printValue(value reflect.Value, verb rune, depth int) {
 			t := f.Type()
 			if t.Elem().Kind() == reflect.Uint8 {
 				var bytes []byte
-				if f.Kind() == reflect.Slice {
+				if f.Kind() == reflect.Slice || f.CanAddr() {
 					bytes = f.Bytes()
-				} else if f.CanAddr() {
-					bytes = f.Slice(0, f.Len()).Bytes()
 				} else {
-					// We have an array, but we cannot Slice() a non-addressable array,
+					// We have an array, but we cannot Bytes() a non-addressable array,
 					// so we build a slice by hand. This is a rare case but it would be nice
 					// if reflection could help a little more.
 					bytes = make([]byte, f.Len())
@@ -869,7 +914,7 @@ func (p *pp) printValue(value reflect.Value, verb rune, depth int) {
 	case reflect.Pointer:
 		// pointer to array or slice or struct? ok at top level
 		// but not embedded (avoid loops)
-		if depth == 0 && f.Pointer() != 0 {
+		if depth == 0 && f.UnsafePointer() != nil {
 			switch a := f.Elem(); a.Kind() {
 			case reflect.Array, reflect.Slice, reflect.Struct, reflect.Map:
 				p.buf.writeByte('&')
@@ -886,7 +931,7 @@ func (p *pp) printValue(value reflect.Value, verb rune, depth int) {
 }
 
 // intFromArg gets the argNumth element of a. On return, isInt reports whether the argument has integer type.
-func intFromArg(a []interface{}, argNum int) (num int, isInt bool, newArgNum int) {
+func intFromArg(a []any, argNum int) (num int, isInt bool, newArgNum int) {
 	newArgNum = argNum
 	if argNum < len(a) {
 		num, isInt = a[argNum].(int) // Almost always OK.
@@ -971,7 +1016,7 @@ func (p *pp) missingArg(verb rune) {
 	p.buf.writeString(missingString)
 }
 
-func (p *pp) doPrintf(format string, a []interface{}) {
+func (p *pp) doPrintf(format string, a []any) {
 	end := len(format)
 	argNum := 0         // we process one argument per non-trivial format
 	afterIndex := false // previous item in format was an index like [3].
@@ -1003,19 +1048,22 @@ formatLoop:
 			case '#':
 				p.fmt.sharp = true
 			case '0':
-				p.fmt.zero = !p.fmt.minus // Only allow zero padding to the left.
+				p.fmt.zero = true
 			case '+':
 				p.fmt.plus = true
 			case '-':
 				p.fmt.minus = true
-				p.fmt.zero = false // Do not pad with zeros to the right.
 			case ' ':
 				p.fmt.space = true
 			default:
 				// Fast path for common case of ascii lower case simple verbs
 				// without precision or width or argument indices.
 				if 'a' <= c && c <= 'z' && argNum < len(a) {
-					if c == 'v' {
+					switch c {
+					case 'w':
+						p.wrappedErrs = append(p.wrappedErrs, argNum)
+						fallthrough
+					case 'v':
 						// Go syntax
 						p.fmt.sharpV = p.fmt.sharp
 						p.fmt.sharp = false
@@ -1110,6 +1158,9 @@ formatLoop:
 			p.badArgNum(verb)
 		case argNum >= len(a): // No argument left over to print for the current verb.
 			p.missingArg(verb)
+		case verb == 'w':
+			p.wrappedErrs = append(p.wrappedErrs, argNum)
+			fallthrough
 		case verb == 'v':
 			// Go syntax
 			p.fmt.sharpV = p.fmt.sharp
@@ -1146,7 +1197,7 @@ formatLoop:
 	}
 }
 
-func (p *pp) doPrint(a []interface{}) {
+func (p *pp) doPrint(a []any) {
 	prevString := false
 	for argNum, arg := range a {
 		isString := arg != nil && reflect.TypeOf(arg).Kind() == reflect.String
@@ -1161,7 +1212,7 @@ func (p *pp) doPrint(a []interface{}) {
 
 // doPrintln is like doPrint but always adds a space between arguments
 // and a newline after the last argument.
-func (p *pp) doPrintln(a []interface{}) {
+func (p *pp) doPrintln(a []any) {
 	for argNum, arg := range a {
 		if argNum > 0 {
 			p.buf.writeByte(' ')

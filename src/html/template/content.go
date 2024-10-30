@@ -112,7 +112,7 @@ const (
 
 // indirect returns the value, after dereferencing as many times
 // as necessary to reach the base type (or nil).
-func indirect(a interface{}) interface{} {
+func indirect(a any) any {
 	if a == nil {
 		return nil
 	}
@@ -128,14 +128,14 @@ func indirect(a interface{}) interface{} {
 }
 
 var (
-	errorType       = reflect.TypeOf((*error)(nil)).Elem()
-	fmtStringerType = reflect.TypeOf((*fmt.Stringer)(nil)).Elem()
+	errorType       = reflect.TypeFor[error]()
+	fmtStringerType = reflect.TypeFor[fmt.Stringer]()
 )
 
 // indirectToStringerOrError returns the value, after dereferencing as many times
 // as necessary to reach the base type (or nil) or an implementation of fmt.Stringer
-// or error,
-func indirectToStringerOrError(a interface{}) interface{} {
+// or error.
+func indirectToStringerOrError(a any) any {
 	if a == nil {
 		return nil
 	}
@@ -148,7 +148,7 @@ func indirectToStringerOrError(a interface{}) interface{} {
 
 // stringify converts its arguments to a string and the type of the content.
 // All pointers are dereferenced, as in the text/template package.
-func stringify(args ...interface{}) (string, contentType) {
+func stringify(args ...any) (string, contentType) {
 	if len(args) == 1 {
 		switch s := indirect(args[0]).(type) {
 		case string:

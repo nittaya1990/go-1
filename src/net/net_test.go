@@ -2,14 +2,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !js
-
 package net
 
 import (
 	"errors"
 	"fmt"
-	"internal/testenv"
 	"io"
 	"net/internal/socktest"
 	"os"
@@ -33,10 +30,7 @@ func TestCloseRead(t *testing.T) {
 			}
 			t.Parallel()
 
-			ln, err := newLocalListener(network)
-			if err != nil {
-				t.Fatal(err)
-			}
+			ln := newLocalListener(t, network)
 			switch network {
 			case "unix", "unixpacket":
 				defer os.Remove(ln.Addr().String())
@@ -101,6 +95,17 @@ func TestCloseWrite(t *testing.T) {
 					t.Error(err)
 					return
 				}
+
+				// Workaround for https://go.dev/issue/49352.
+				// On arm64 macOS (current as of macOS 12.4),
+				// reading from a socket at the same time as the client
+				// is closing it occasionally hangs for 60 seconds before
+				// returning ECONNRESET. Sleep for a bit to give the
+				// socket time to close before trying to read from it.
+				if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
+					time.Sleep(10 * time.Millisecond)
+				}
+
 				if !deadline.IsZero() {
 					c.SetDeadline(deadline)
 				}
@@ -132,10 +137,7 @@ func TestCloseWrite(t *testing.T) {
 				}
 			}
 
-			ls, err := newLocalServer(network)
-			if err != nil {
-				t.Fatal(err)
-			}
+			ls := newLocalServer(t, network)
 			defer ls.teardown()
 			if err := ls.buildup(handler); err != nil {
 				t.Fatal(err)
@@ -189,10 +191,7 @@ func TestConnClose(t *testing.T) {
 			}
 			t.Parallel()
 
-			ln, err := newLocalListener(network)
-			if err != nil {
-				t.Fatal(err)
-			}
+			ln := newLocalListener(t, network)
 			switch network {
 			case "unix", "unixpacket":
 				defer os.Remove(ln.Addr().String())
@@ -234,16 +233,12 @@ func TestListenerClose(t *testing.T) {
 			}
 			t.Parallel()
 
-			ln, err := newLocalListener(network)
-			if err != nil {
-				t.Fatal(err)
-			}
+			ln := newLocalListener(t, network)
 			switch network {
 			case "unix", "unixpacket":
 				defer os.Remove(ln.Addr().String())
 			}
 
-			dst := ln.Addr().String()
 			if err := ln.Close(); err != nil {
 				if perr := parseCloseError(err, false); perr != nil {
 					t.Error(perr)
@@ -256,28 +251,12 @@ func TestListenerClose(t *testing.T) {
 				t.Fatal("should fail")
 			}
 
-			if network == "tcp" {
-				// We will have two TCP FSMs inside the
-				// kernel here. There's no guarantee that a
-				// signal comes from the far end FSM will be
-				// delivered immediately to the near end FSM,
-				// especially on the platforms that allow
-				// multiple consumer threads to pull pending
-				// established connections at the same time by
-				// enabling SO_REUSEPORT option such as Linux,
-				// DragonFly BSD. So we need to give some time
-				// quantum to the kernel.
-				//
-				// Note that net.inet.tcp.reuseport_ext=1 by
-				// default on DragonFly BSD.
-				time.Sleep(time.Millisecond)
-
-				cc, err := Dial("tcp", dst)
-				if err == nil {
-					t.Error("Dial to closed TCP listener succeeded.")
-					cc.Close()
-				}
-			}
+			// Note: we cannot ensure that a subsequent Dial does not succeed, because
+			// we do not in general have any guarantee that ln.Addr is not immediately
+			// reused. (TCP sockets enter a TIME_WAIT state when closed, but that only
+			// applies to existing connections for the port — it does not prevent the
+			// port itself from being used for entirely new connections in the
+			// meantime.)
 		})
 	}
 }
@@ -292,10 +271,7 @@ func TestPacketConnClose(t *testing.T) {
 			}
 			t.Parallel()
 
-			c, err := newLocalPacketListener(network)
-			if err != nil {
-				t.Fatal(err)
-			}
+			c := newLocalPacketListener(t, network)
 			switch network {
 			case "unixgram":
 				defer os.Remove(c.LocalAddr().String())
@@ -315,31 +291,6 @@ func TestPacketConnClose(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestListenCloseListen(t *testing.T) {
-	const maxTries = 10
-	for tries := 0; tries < maxTries; tries++ {
-		ln, err := newLocalListener("tcp")
-		if err != nil {
-			t.Fatal(err)
-		}
-		addr := ln.Addr().String()
-		if err := ln.Close(); err != nil {
-			if perr := parseCloseError(err, false); perr != nil {
-				t.Error(perr)
-			}
-			t.Fatal(err)
-		}
-		ln, err = Listen("tcp", addr)
-		if err == nil {
-			// Success. (This test didn't always make it here earlier.)
-			ln.Close()
-			return
-		}
-		t.Errorf("failed on try %d/%d: %v", tries+1, maxTries, err)
-	}
-	t.Fatalf("failed to listen/close/listen on same address after %d tries", maxTries)
 }
 
 // See golang.org/issue/6163, golang.org/issue/6987.
@@ -377,10 +328,7 @@ func TestAcceptIgnoreAbortedConnRequest(t *testing.T) {
 		}
 		c.Close()
 	}
-	ls, err := newLocalServer("tcp")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ls := newLocalServer(t, "tcp")
 	defer ls.teardown()
 	if err := ls.buildup(handler); err != nil {
 		t.Fatal(err)
@@ -407,13 +355,18 @@ func TestZeroByteRead(t *testing.T) {
 			}
 			t.Parallel()
 
-			ln, err := newLocalListener(network)
-			if err != nil {
-				t.Fatal(err)
-			}
+			ln := newLocalListener(t, network)
 			connc := make(chan Conn, 1)
+			defer func() {
+				ln.Close()
+				for c := range connc {
+					if c != nil {
+						c.Close()
+					}
+				}
+			}()
 			go func() {
-				defer ln.Close()
+				defer close(connc)
 				c, err := ln.Accept()
 				if err != nil {
 					t.Error(err)
@@ -459,10 +412,8 @@ func TestZeroByteRead(t *testing.T) {
 // runs peer1 and peer2 concurrently. withTCPConnPair returns when
 // both have completed.
 func withTCPConnPair(t *testing.T, peer1, peer2 func(c *TCPConn) error) {
-	ln, err := newLocalListener("tcp")
-	if err != nil {
-		t.Fatal(err)
-	}
+	t.Helper()
+	ln := newLocalListener(t, "tcp")
 	defer ln.Close()
 	errc := make(chan error, 2)
 	go func() {
@@ -471,8 +422,9 @@ func withTCPConnPair(t *testing.T, peer1, peer2 func(c *TCPConn) error) {
 			errc <- err
 			return
 		}
-		defer c1.Close()
-		errc <- peer1(c1.(*TCPConn))
+		err = peer1(c1.(*TCPConn))
+		c1.Close()
+		errc <- err
 	}()
 	go func() {
 		c2, err := Dial("tcp", ln.Addr().String())
@@ -480,12 +432,13 @@ func withTCPConnPair(t *testing.T, peer1, peer2 func(c *TCPConn) error) {
 			errc <- err
 			return
 		}
-		defer c2.Close()
-		errc <- peer2(c2.(*TCPConn))
+		err = peer2(c2.(*TCPConn))
+		c2.Close()
+		errc <- err
 	}()
 	for i := 0; i < 2; i++ {
 		if err := <-errc; err != nil {
-			t.Fatal(err)
+			t.Error(err)
 		}
 	}
 }
@@ -557,35 +510,50 @@ func TestCloseUnblocksRead(t *testing.T) {
 
 // Issue 24808: verify that ECONNRESET is not temporary for read.
 func TestNotTemporaryRead(t *testing.T) {
-	if runtime.GOOS == "freebsd" {
-		testenv.SkipFlaky(t, 25289)
-	}
-	if runtime.GOOS == "aix" {
-		testenv.SkipFlaky(t, 29685)
-	}
 	t.Parallel()
-	server := func(cs *TCPConn) error {
-		cs.SetLinger(0)
-		// Give the client time to get stuck in a Read.
-		time.Sleep(50 * time.Millisecond)
-		cs.Close()
-		return nil
-	}
-	client := func(ss *TCPConn) error {
-		_, err := ss.Read([]byte{0})
-		if err == nil {
-			return errors.New("Read succeeded unexpectedly")
-		} else if err == io.EOF {
-			// This happens on Plan 9.
-			return nil
-		} else if ne, ok := err.(Error); !ok {
-			return fmt.Errorf("unexpected error %v", err)
-		} else if ne.Temporary() {
-			return fmt.Errorf("unexpected temporary error %v", err)
+
+	ln := newLocalListener(t, "tcp")
+	serverDone := make(chan struct{})
+	dialed := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+
+		cs, err := ln.Accept()
+		if err != nil {
+			return
 		}
-		return nil
+		<-dialed
+		cs.(*TCPConn).SetLinger(0)
+		cs.Close()
+	}()
+	defer func() {
+		ln.Close()
+		<-serverDone
+	}()
+
+	ss, err := Dial("tcp", ln.Addr().String())
+	close(dialed)
+	if err != nil {
+		t.Fatal(err)
 	}
-	withTCPConnPair(t, client, server)
+	defer ss.Close()
+
+	_, err = ss.Read([]byte{0})
+	if err == nil {
+		t.Fatal("Read succeeded unexpectedly")
+	} else if err == io.EOF {
+		// This happens on Plan 9, but for some reason (prior to CL 385314) it was
+		// accepted everywhere else too.
+		if runtime.GOOS == "plan9" {
+			return
+		}
+		t.Fatal("Read unexpectedly returned io.EOF after socket was abruptly closed")
+	}
+	if ne, ok := err.(Error); !ok {
+		t.Errorf("Read error does not implement net.Error: %v", err)
+	} else if ne.Temporary() {
+		t.Errorf("Read error is unexpectedly temporary: %v", err)
+	}
 }
 
 // The various errors should implement the Error interface.

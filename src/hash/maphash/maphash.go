@@ -2,35 +2,80 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package maphash provides hash functions on byte sequences.
+// Package maphash provides hash functions on byte sequences and comparable values.
 // These hash functions are intended to be used to implement hash tables or
 // other data structures that need to map arbitrary strings or byte
 // sequences to a uniform distribution on unsigned 64-bit integers.
-// Each different instance of a hash table or data structure should use its own Seed.
+// Each different instance of a hash table or data structure should use its own [Seed].
 //
 // The hash functions are not cryptographically secure.
 // (See crypto/sha256 and crypto/sha512 for cryptographic use.)
-//
 package maphash
 
 import (
-	"internal/unsafeheader"
-	"unsafe"
+	"internal/abi"
+	"internal/byteorder"
+	"math"
+	"reflect"
 )
 
 // A Seed is a random value that selects the specific hash function
-// computed by a Hash. If two Hashes use the same Seeds, they
+// computed by a [Hash]. If two Hashes use the same Seeds, they
 // will compute the same hash values for any given input.
 // If two Hashes use different Seeds, they are very likely to compute
 // distinct hash values for any given input.
 //
-// A Seed must be initialized by calling MakeSeed.
-// The zero seed is uninitialized and not valid for use with Hash's SetSeed method.
+// A Seed must be initialized by calling [MakeSeed].
+// The zero seed is uninitialized and not valid for use with [Hash]'s SetSeed method.
 //
 // Each Seed value is local to a single process and cannot be serialized
 // or otherwise recreated in a different process.
 type Seed struct {
 	s uint64
+}
+
+// Bytes returns the hash of b with the given seed.
+//
+// Bytes is equivalent to, but more convenient and efficient than:
+//
+//	var h Hash
+//	h.SetSeed(seed)
+//	h.Write(b)
+//	return h.Sum64()
+func Bytes(seed Seed, b []byte) uint64 {
+	state := seed.s
+	if state == 0 {
+		panic("maphash: use of uninitialized Seed")
+	}
+
+	if len(b) > bufSize {
+		b = b[:len(b):len(b)] // merge len and cap calculations when reslicing
+		for len(b) > bufSize {
+			state = rthash(b[:bufSize], state)
+			b = b[bufSize:]
+		}
+	}
+	return rthash(b, state)
+}
+
+// String returns the hash of s with the given seed.
+//
+// String is equivalent to, but more convenient and efficient than:
+//
+//	var h Hash
+//	h.SetSeed(seed)
+//	h.WriteString(s)
+//	return h.Sum64()
+func String(seed Seed, s string) uint64 {
+	state := seed.s
+	if state == 0 {
+		panic("maphash: use of uninitialized Seed")
+	}
+	for len(s) > bufSize {
+		state = rthashString(s[:bufSize], state)
+		s = s[bufSize:]
+	}
+	return rthashString(s, state)
 }
 
 // A Hash computes a seeded hash of a byte sequence.
@@ -44,9 +89,9 @@ type Seed struct {
 // the sequence of bytes provided to the Hash object, not on the way
 // in which the bytes are provided. For example, the three sequences
 //
-//     h.Write([]byte{'f','o','o'})
-//     h.WriteByte('f'); h.WriteByte('o'); h.WriteByte('o')
-//     h.WriteString("foo")
+//	h.Write([]byte{'f','o','o'})
+//	h.WriteByte('f'); h.WriteByte('o'); h.WriteByte('o')
+//	h.WriteString("foo")
 //
 // all have the same effect.
 //
@@ -84,7 +129,7 @@ func (h *Hash) initSeed() {
 }
 
 // WriteByte adds b to the sequence of bytes hashed by h.
-// It never fails; the error result is for implementing io.ByteWriter.
+// It never fails; the error result is for implementing [io.ByteWriter].
 func (h *Hash) WriteByte(b byte) error {
 	if h.n == len(h.buf) {
 		h.flush()
@@ -95,7 +140,7 @@ func (h *Hash) WriteByte(b byte) error {
 }
 
 // Write adds b to the sequence of bytes hashed by h.
-// It always writes all of b and never fails; the count and error result are for implementing io.Writer.
+// It always writes all of b and never fails; the count and error result are for implementing [io.Writer].
 func (h *Hash) Write(b []byte) (int, error) {
 	size := len(b)
 	// Deal with bytes left over in h.buf.
@@ -116,7 +161,7 @@ func (h *Hash) Write(b []byte) (int, error) {
 	if len(b) > bufSize {
 		h.initSeed()
 		for len(b) > bufSize {
-			h.state.s = rthash(&b[0], bufSize, h.state.s)
+			h.state.s = rthash(b[:bufSize], h.state.s)
 			b = b[bufSize:]
 		}
 	}
@@ -127,7 +172,7 @@ func (h *Hash) Write(b []byte) (int, error) {
 }
 
 // WriteString adds the bytes of s to the sequence of bytes hashed by h.
-// It always writes all of s and never fails; the count and error result are for implementing io.StringWriter.
+// It always writes all of s and never fails; the count and error result are for implementing [io.StringWriter].
 func (h *Hash) WriteString(s string) (int, error) {
 	// WriteString mirrors Write. See Write for comments.
 	size := len(s)
@@ -143,8 +188,7 @@ func (h *Hash) WriteString(s string) (int, error) {
 	if len(s) > bufSize {
 		h.initSeed()
 		for len(s) > bufSize {
-			ptr := (*byte)((*unsafeheader.String)(unsafe.Pointer(&s)).Data)
-			h.state.s = rthash(ptr, bufSize, h.state.s)
+			h.state.s = rthashString(s[:bufSize], h.state.s)
 			s = s[bufSize:]
 		}
 	}
@@ -159,10 +203,10 @@ func (h *Hash) Seed() Seed {
 	return h.seed
 }
 
-// SetSeed sets h to use seed, which must have been returned by MakeSeed
-// or by another Hash's Seed method.
-// Two Hash objects with the same seed behave identically.
-// Two Hash objects with different seeds will very likely behave differently.
+// SetSeed sets h to use seed, which must have been returned by [MakeSeed]
+// or by another [Hash.Seed] method.
+// Two [Hash] objects with the same seed behave identically.
+// Two [Hash] objects with different seeds will very likely behave differently.
 // Any bytes added to h before this call will be discarded.
 func (h *Hash) SetSeed(seed Seed) {
 	if seed.s == 0 {
@@ -187,62 +231,39 @@ func (h *Hash) flush() {
 		panic("maphash: flush of partially full buffer")
 	}
 	h.initSeed()
-	h.state.s = rthash(&h.buf[0], h.n, h.state.s)
+	h.state.s = rthash(h.buf[:h.n], h.state.s)
 	h.n = 0
 }
 
 // Sum64 returns h's current 64-bit value, which depends on
 // h's seed and the sequence of bytes added to h since the
-// last call to Reset or SetSeed.
+// last call to [Hash.Reset] or [Hash.SetSeed].
 //
 // All bits of the Sum64 result are close to uniformly and
 // independently distributed, so it can be safely reduced
 // by using bit masking, shifting, or modular arithmetic.
 func (h *Hash) Sum64() uint64 {
 	h.initSeed()
-	return rthash(&h.buf[0], h.n, h.state.s)
+	return rthash(h.buf[:h.n], h.state.s)
 }
 
 // MakeSeed returns a new random seed.
 func MakeSeed() Seed {
-	var s1, s2 uint64
+	var s uint64
 	for {
-		s1 = uint64(runtime_fastrand())
-		s2 = uint64(runtime_fastrand())
+		s = randUint64()
 		// We use seed 0 to indicate an uninitialized seed/hash,
 		// so keep trying until we get a non-zero seed.
-		if s1|s2 != 0 {
+		if s != 0 {
 			break
 		}
 	}
-	return Seed{s: s1<<32 + s2}
+	return Seed{s: s}
 }
-
-//go:linkname runtime_fastrand runtime.fastrand
-func runtime_fastrand() uint32
-
-func rthash(ptr *byte, len int, seed uint64) uint64 {
-	if len == 0 {
-		return seed
-	}
-	// The runtime hasher only works on uintptr. For 64-bit
-	// architectures, we use the hasher directly. Otherwise,
-	// we use two parallel hashers on the lower and upper 32 bits.
-	if unsafe.Sizeof(uintptr(0)) == 8 {
-		return uint64(runtime_memhash(unsafe.Pointer(ptr), uintptr(seed), uintptr(len)))
-	}
-	lo := runtime_memhash(unsafe.Pointer(ptr), uintptr(seed), uintptr(len))
-	hi := runtime_memhash(unsafe.Pointer(ptr), uintptr(seed>>32), uintptr(len))
-	return uint64(hi)<<32 | uint64(lo)
-}
-
-//go:linkname runtime_memhash runtime.memhash
-//go:noescape
-func runtime_memhash(p unsafe.Pointer, seed, s uintptr) uintptr
 
 // Sum appends the hash's current 64-bit value to b.
-// It exists for implementing hash.Hash.
-// For direct calls, it is more efficient to use Sum64.
+// It exists for implementing [hash.Hash].
+// For direct calls, it is more efficient to use [Hash.Sum64].
 func (h *Hash) Sum(b []byte) []byte {
 	x := h.Sum64()
 	return append(b,
@@ -261,3 +282,117 @@ func (h *Hash) Size() int { return 8 }
 
 // BlockSize returns h's block size.
 func (h *Hash) BlockSize() int { return len(h.buf) }
+
+// Comparable returns the hash of comparable value v with the given seed
+// such that Comparable(s, v1) == Comparable(s, v2) if v1 == v2.
+// If v != v, then the resulting hash is randomly distributed.
+func Comparable[T comparable](seed Seed, v T) uint64 {
+	comparableReady(v)
+	var h Hash
+	h.SetSeed(seed)
+	comparableF(&h, v)
+	return h.Sum64()
+}
+
+func comparableReady[T comparable](v T) {
+	// Force v to be on the heap.
+	// We cannot hash pointers to local variables,
+	// as the address of the local variable
+	// might change on stack growth.
+	abi.Escape(v)
+}
+
+// WriteComparable adds x to the data hashed by h.
+func WriteComparable[T comparable](h *Hash, x T) {
+	comparableReady(x)
+	comparableF(h, x)
+}
+
+// appendT hash a value,
+// when the value cannot be directly hash raw memory,
+// or when purego is used.
+func appendT(h *Hash, v reflect.Value) {
+	h.WriteString(v.Type().String())
+	switch v.Kind() {
+	case reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Int:
+		var buf [8]byte
+		byteorder.LePutUint64(buf[:], uint64(v.Int()))
+		h.Write(buf[:])
+		return
+	case reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uint, reflect.Uintptr:
+		var buf [8]byte
+		byteorder.LePutUint64(buf[:], v.Uint())
+		h.Write(buf[:])
+		return
+	case reflect.Array:
+		var buf [8]byte
+		for i := range uint64(v.Len()) {
+			byteorder.LePutUint64(buf[:], i)
+			// do not want to hash to the same value,
+			// [2]string{"foo", ""} and [2]string{"", "foo"}.
+			h.Write(buf[:])
+			appendT(h, v.Index(int(i)))
+		}
+		return
+	case reflect.String:
+		h.WriteString(v.String())
+		return
+	case reflect.Struct:
+		var buf [8]byte
+		for i := range v.NumField() {
+			f := v.Field(i)
+			byteorder.LePutUint64(buf[:], uint64(i))
+			// do not want to hash to the same value,
+			// struct{a,b string}{"foo",""} and
+			// struct{a,b string}{"","foo"}.
+			h.Write(buf[:])
+			appendT(h, f)
+		}
+		return
+	case reflect.Complex64, reflect.Complex128:
+		c := v.Complex()
+		h.float64(real(c))
+		h.float64(imag(c))
+		return
+	case reflect.Float32, reflect.Float64:
+		h.float64(v.Float())
+		return
+	case reflect.Bool:
+		h.WriteByte(btoi(v.Bool()))
+		return
+	case reflect.UnsafePointer, reflect.Pointer:
+		var buf [8]byte
+		// because pointing to the abi.Escape call in comparableReady,
+		// So this is ok to hash pointer,
+		// this way because we know their target won't be moved.
+		byteorder.LePutUint64(buf[:], uint64(v.Pointer()))
+		h.Write(buf[:])
+		return
+	case reflect.Interface:
+		appendT(h, v.Elem())
+		return
+	}
+	panic("maphash: " + v.Type().String() + " not comparable")
+}
+
+func (h *Hash) float64(f float64) {
+	if f == 0 {
+		h.WriteByte(0)
+		return
+	}
+	var buf [8]byte
+	if f != f {
+		byteorder.LePutUint64(buf[:], randUint64())
+		h.Write(buf[:])
+		return
+	}
+	byteorder.LePutUint64(buf[:], math.Float64bits(f))
+	h.Write(buf[:])
+}
+
+func btoi(b bool) byte {
+	if b {
+		return 1
+	}
+	return 0
+}

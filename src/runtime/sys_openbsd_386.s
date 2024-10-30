@@ -69,7 +69,7 @@ TEXT runtime·sigfwd(SB),NOSPLIT,$0-16
 	RET
 
 // Called by OS using C ABI.
-TEXT runtime·sigtramp(SB),NOSPLIT,$28
+TEXT runtime·sigtramp(SB),NOSPLIT|TOPFRAME,$28
 	NOP	SP	// tell vet SP changed - stop checking offsets
 	// Save callee-saved C registers, since the caller may be a C signal handler.
 	MOVL	BX, bx-4(SP)
@@ -520,8 +520,11 @@ TEXT runtime·clock_gettime_trampoline(SB),NOSPLIT,$0
 	MOVL	BX, 4(SP)		// arg 2 - clock_id
 	CALL	libc_clock_gettime(SB)
 	CMPL	AX, $-1
-	JNE	2(PC)
-	MOVL	$0xf1, 0xf1		// crash on failure
+	JNE	noerr
+	CALL	libc_errno(SB)
+	MOVL	(AX), AX
+	NEGL	AX			// caller expects negative errno
+noerr:
 	MOVL	BP, SP
 	POPL	BP
 	RET
@@ -539,6 +542,16 @@ TEXT runtime·fcntl_trampoline(SB),NOSPLIT,$0
 	MOVL	CX, 8(SP)		// arg 3 - arg
 	MOVL	$0, 12(SP)		// vararg
 	CALL	libc_fcntl(SB)
+	MOVL	$0, BX
+	CMPL	AX, $-1
+	JNE	noerr
+	CALL	libc_errno(SB)
+	MOVL	(AX), BX
+	MOVL	$-1, AX
+noerr:
+	MOVL	24(SP), DX		// pointer to args
+	MOVL	AX, 12(DX)
+	MOVL	BX, 16(DX)
 	MOVL	BP, SP
 	POPL	BP
 	RET
@@ -964,5 +977,14 @@ TEXT runtime·syscall10X(SB),NOSPLIT,$0
 ok:
 	MOVL	$0, AX			// no error (it's ignored anyway)
 	MOVL	BP, SP
+	POPL	BP
+	RET
+
+TEXT runtime·issetugid_trampoline(SB),NOSPLIT,$0
+	PUSHL	BP
+	CALL	libc_issetugid(SB)
+	NOP	SP			// tell vet SP changed - stop checking offsets
+	MOVL	8(SP), DX		// pointer to return value
+	MOVL	AX, 0(DX)
 	POPL	BP
 	RET

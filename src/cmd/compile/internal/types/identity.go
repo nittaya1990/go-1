@@ -39,10 +39,10 @@ func identical(t1, t2 *Type, flags int, assumedEqual map[typePair]struct{}) bool
 	if t1 == t2 {
 		return true
 	}
-	if t1 == nil || t2 == nil || t1.kind != t2.kind || t1.Broke() || t2.Broke() {
+	if t1 == nil || t2 == nil || t1.kind != t2.kind {
 		return false
 	}
-	if t1.sym != nil || t2.sym != nil {
+	if t1.obj != nil || t2.obj != nil {
 		if flags&identStrict == 0 && (t1.HasShape() || t2.HasShape()) {
 			switch t1.kind {
 			case TINT8, TUINT8, TINT16, TUINT16, TINT32, TUINT32, TINT64, TUINT64, TINT, TUINT, TUINTPTR, TCOMPLEX64, TCOMPLEX128, TFLOAT32, TFLOAT64, TBOOL, TSTRING, TPTR, TUNSAFEPTR:
@@ -58,6 +58,14 @@ func identical(t1, t2 *Type, flags int, assumedEqual map[typePair]struct{}) bool
 			return (t1 == Types[TUINT8] || t1 == ByteType) && (t2 == Types[TUINT8] || t2 == ByteType)
 		case TINT32:
 			return (t1 == Types[TINT32] || t1 == RuneType) && (t2 == Types[TINT32] || t2 == RuneType)
+		case TINTER:
+			// Make sure named any type matches any unnamed empty interface
+			// (but not a shape type, if identStrict).
+			isUnnamedEface := func(t *Type) bool { return t.IsEmptyInterface() && t.Sym() == nil }
+			if flags&identStrict != 0 {
+				return t1 == AnyType && isUnnamedEface(t2) && !t2.HasShape() || t2 == AnyType && isUnnamedEface(t1) && !t1.HasShape()
+			}
+			return t1 == AnyType && isUnnamedEface(t2) || t2 == AnyType && isUnnamedEface(t1)
 		default:
 			return false
 		}
@@ -84,11 +92,11 @@ cont:
 		return true
 
 	case TINTER:
-		if t1.AllMethods().Len() != t2.AllMethods().Len() {
+		if len(t1.AllMethods()) != len(t2.AllMethods()) {
 			return false
 		}
-		for i, f1 := range t1.AllMethods().Slice() {
-			f2 := t2.AllMethods().Index(i)
+		for i, f1 := range t1.AllMethods() {
+			f2 := t2.AllMethods()[i]
 			if f1.Sym != f2.Sym || !identical(f1.Type, f2.Type, flags, assumedEqual) {
 				return false
 			}
@@ -99,7 +107,7 @@ cont:
 		if t1.NumFields() != t2.NumFields() {
 			return false
 		}
-		for i, f1 := range t1.FieldSlice() {
+		for i, f1 := range t1.Fields() {
 			f2 := t2.Field(i)
 			if f1.Sym != f2.Sym || f1.Embedded != f2.Embedded || !identical(f1.Type, f2.Type, flags, assumedEqual) {
 				return false
@@ -114,17 +122,17 @@ cont:
 		// Check parameters and result parameters for type equality.
 		// We intentionally ignore receiver parameters for type
 		// equality, because they're never relevant.
-		for _, f := range ParamsResults {
-			// Loop over fields in structs, ignoring argument names.
-			fs1, fs2 := f(t1).FieldSlice(), f(t2).FieldSlice()
-			if len(fs1) != len(fs2) {
+		if t1.NumParams() != t2.NumParams() ||
+			t1.NumResults() != t2.NumResults() ||
+			t1.IsVariadic() != t2.IsVariadic() {
+			return false
+		}
+
+		fs1 := t1.ParamsResults()
+		fs2 := t2.ParamsResults()
+		for i, f1 := range fs1 {
+			if !identical(f1.Type, fs2[i].Type, flags, assumedEqual) {
 				return false
-			}
-			for i, f1 := range fs1 {
-				f2 := fs2[i]
-				if f1.IsDDD() != f2.IsDDD() || !identical(f1.Type, f2.Type, flags, assumedEqual) {
-					return false
-				}
 			}
 		}
 		return true

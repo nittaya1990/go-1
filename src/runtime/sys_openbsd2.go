@@ -8,10 +8,12 @@ package runtime
 
 import (
 	"internal/abi"
+	"internal/runtime/atomic"
 	"unsafe"
 )
 
 // This is exported via linkname to assembly in runtime/cgo.
+//
 //go:linkname exit
 //go:nosplit
 //go:cgo_unsafe_args
@@ -45,6 +47,7 @@ func thrkill_trampoline()
 // mmap is used to do low-level memory allocation via mmap. Don't allow stack
 // splits, since this function (used by sysAlloc) is called in a lot of low-level
 // parts of the runtime and callers often assume it won't acquire any locks.
+//
 //go:nosplit
 func mmap(addr unsafe.Pointer, n uintptr, prot, flags, fd int32, off uint32) (unsafe.Pointer, int) {
 	args := struct {
@@ -56,6 +59,7 @@ func mmap(addr unsafe.Pointer, n uintptr, prot, flags, fd int32, off uint32) (un
 		ret2            int
 	}{addr, n, prot, flags, fd, off, nil, 0}
 	libcCall(unsafe.Pointer(abi.FuncPCABI0(mmap_trampoline)), unsafe.Pointer(&args))
+	KeepAlive(addr) // Just for consistency. Hopefully addr is not a Go address.
 	return args.ret1, args.ret2
 }
 func mmap_trampoline()
@@ -64,6 +68,7 @@ func mmap_trampoline()
 //go:cgo_unsafe_args
 func munmap(addr unsafe.Pointer, n uintptr) {
 	libcCall(unsafe.Pointer(abi.FuncPCABI0(munmap_trampoline)), unsafe.Pointer(&addr))
+	KeepAlive(addr) // Just for consistency. Hopefully addr is not a Go address.
 }
 func munmap_trampoline()
 
@@ -71,13 +76,16 @@ func munmap_trampoline()
 //go:cgo_unsafe_args
 func madvise(addr unsafe.Pointer, n uintptr, flags int32) {
 	libcCall(unsafe.Pointer(abi.FuncPCABI0(madvise_trampoline)), unsafe.Pointer(&addr))
+	KeepAlive(addr) // Just for consistency. Hopefully addr is not a Go address.
 }
 func madvise_trampoline()
 
 //go:nosplit
 //go:cgo_unsafe_args
 func open(name *byte, mode, perm int32) (ret int32) {
-	return libcCall(unsafe.Pointer(abi.FuncPCABI0(open_trampoline)), unsafe.Pointer(&name))
+	ret = libcCall(unsafe.Pointer(abi.FuncPCABI0(open_trampoline)), unsafe.Pointer(&name))
+	KeepAlive(name)
+	return
 }
 func open_trampoline()
 
@@ -91,20 +99,20 @@ func close_trampoline()
 //go:nosplit
 //go:cgo_unsafe_args
 func read(fd int32, p unsafe.Pointer, n int32) int32 {
-	return libcCall(unsafe.Pointer(abi.FuncPCABI0(read_trampoline)), unsafe.Pointer(&fd))
+	ret := libcCall(unsafe.Pointer(abi.FuncPCABI0(read_trampoline)), unsafe.Pointer(&fd))
+	KeepAlive(p)
+	return ret
 }
 func read_trampoline()
 
 //go:nosplit
 //go:cgo_unsafe_args
 func write1(fd uintptr, p unsafe.Pointer, n int32) int32 {
-	return libcCall(unsafe.Pointer(abi.FuncPCABI0(write_trampoline)), unsafe.Pointer(&fd))
+	ret := libcCall(unsafe.Pointer(abi.FuncPCABI0(write_trampoline)), unsafe.Pointer(&fd))
+	KeepAlive(p)
+	return ret
 }
 func write_trampoline()
-
-func pipe() (r, w int32, errno int32) {
-	return pipe2(0)
-}
 
 func pipe2(flags int32) (r, w int32, errno int32) {
 	var p [2]int32
@@ -121,6 +129,8 @@ func pipe2_trampoline()
 //go:cgo_unsafe_args
 func setitimer(mode int32, new, old *itimerval) {
 	libcCall(unsafe.Pointer(abi.FuncPCABI0(setitimer_trampoline)), unsafe.Pointer(&mode))
+	KeepAlive(new)
+	KeepAlive(old)
 }
 func setitimer_trampoline()
 
@@ -140,14 +150,24 @@ func usleep_no_g(usec uint32) {
 //go:nosplit
 //go:cgo_unsafe_args
 func sysctl(mib *uint32, miblen uint32, out *byte, size *uintptr, dst *byte, ndst uintptr) int32 {
-	return libcCall(unsafe.Pointer(abi.FuncPCABI0(sysctl_trampoline)), unsafe.Pointer(&mib))
+	ret := libcCall(unsafe.Pointer(abi.FuncPCABI0(sysctl_trampoline)), unsafe.Pointer(&mib))
+	KeepAlive(mib)
+	KeepAlive(out)
+	KeepAlive(size)
+	KeepAlive(dst)
+	return ret
 }
 func sysctl_trampoline()
 
 //go:nosplit
 //go:cgo_unsafe_args
-func fcntl(fd, cmd, arg int32) int32 {
-	return libcCall(unsafe.Pointer(abi.FuncPCABI0(fcntl_trampoline)), unsafe.Pointer(&fd))
+func fcntl(fd, cmd, arg int32) (ret int32, errno int32) {
+	args := struct {
+		fd, cmd, arg int32
+		ret, errno   int32
+	}{fd, cmd, arg, 0, 0}
+	libcCall(unsafe.Pointer(abi.FuncPCABI0(fcntl_trampoline)), unsafe.Pointer(&args))
+	return args.ret, args.errno
 }
 func fcntl_trampoline()
 
@@ -158,7 +178,13 @@ func nanotime1() int64 {
 		clock_id int32
 		tp       unsafe.Pointer
 	}{_CLOCK_MONOTONIC, unsafe.Pointer(&ts)}
-	libcCall(unsafe.Pointer(abi.FuncPCABI0(clock_gettime_trampoline)), unsafe.Pointer(&args))
+	if errno := libcCall(unsafe.Pointer(abi.FuncPCABI0(clock_gettime_trampoline)), unsafe.Pointer(&args)); errno < 0 {
+		// Avoid growing the nosplit stack.
+		systemstack(func() {
+			println("runtime: errno", -errno)
+			throw("clock_gettime failed")
+		})
+	}
 	return ts.tv_sec*1e9 + int64(ts.tv_nsec)
 }
 func clock_gettime_trampoline()
@@ -170,7 +196,13 @@ func walltime() (int64, int32) {
 		clock_id int32
 		tp       unsafe.Pointer
 	}{_CLOCK_REALTIME, unsafe.Pointer(&ts)}
-	libcCall(unsafe.Pointer(abi.FuncPCABI0(clock_gettime_trampoline)), unsafe.Pointer(&args))
+	if errno := libcCall(unsafe.Pointer(abi.FuncPCABI0(clock_gettime_trampoline)), unsafe.Pointer(&args)); errno < 0 {
+		// Avoid growing the nosplit stack.
+		systemstack(func() {
+			println("runtime: errno", -errno)
+			throw("clock_gettime failed")
+		})
+	}
 	return ts.tv_sec, int32(ts.tv_nsec)
 }
 
@@ -184,7 +216,11 @@ func kqueue_trampoline()
 //go:nosplit
 //go:cgo_unsafe_args
 func kevent(kq int32, ch *keventt, nch int32, ev *keventt, nev int32, ts *timespec) int32 {
-	return libcCall(unsafe.Pointer(abi.FuncPCABI0(kevent_trampoline)), unsafe.Pointer(&kq))
+	ret := libcCall(unsafe.Pointer(abi.FuncPCABI0(kevent_trampoline)), unsafe.Pointer(&kq))
+	KeepAlive(ch)
+	KeepAlive(ev)
+	KeepAlive(ts)
+	return ret
 }
 func kevent_trampoline()
 
@@ -192,6 +228,8 @@ func kevent_trampoline()
 //go:cgo_unsafe_args
 func sigaction(sig uint32, new *sigactiont, old *sigactiont) {
 	libcCall(unsafe.Pointer(abi.FuncPCABI0(sigaction_trampoline)), unsafe.Pointer(&sig))
+	KeepAlive(new)
+	KeepAlive(old)
 }
 func sigaction_trampoline()
 
@@ -201,6 +239,8 @@ func sigprocmask(how uint32, new *sigset, old *sigset) {
 	// sigprocmask is called from sigsave, which is called from needm.
 	// As such, we have to be able to run with no g here.
 	asmcgocall_no_g(unsafe.Pointer(abi.FuncPCABI0(sigprocmask_trampoline)), unsafe.Pointer(&how))
+	KeepAlive(new)
+	KeepAlive(old)
 }
 func sigprocmask_trampoline()
 
@@ -208,23 +248,23 @@ func sigprocmask_trampoline()
 //go:cgo_unsafe_args
 func sigaltstack(new *stackt, old *stackt) {
 	libcCall(unsafe.Pointer(abi.FuncPCABI0(sigaltstack_trampoline)), unsafe.Pointer(&new))
+	KeepAlive(new)
+	KeepAlive(old)
 }
 func sigaltstack_trampoline()
 
 // Not used on OpenBSD, but must be defined.
-func exitThread(wait *uint32) {
+func exitThread(wait *atomic.Uint32) {
+	throw("exitThread")
 }
 
 //go:nosplit
-func closeonexec(fd int32) {
-	fcntl(fd, _F_SETFD, _FD_CLOEXEC)
+//go:cgo_unsafe_args
+func issetugid() (ret int32) {
+	libcCall(unsafe.Pointer(abi.FuncPCABI0(issetugid_trampoline)), unsafe.Pointer(&ret))
+	return
 }
-
-//go:nosplit
-func setNonblock(fd int32) {
-	flags := fcntl(fd, _F_GETFL, 0)
-	fcntl(fd, _F_SETFL, flags|_O_NONBLOCK)
-}
+func issetugid_trampoline()
 
 // Tell the linker that the libc_* functions are to be found
 // in a system library, with the libc_ prefix missing.
@@ -257,5 +297,7 @@ func setNonblock(fd int32) {
 
 //go:cgo_import_dynamic libc_sigaction sigaction "libc.so"
 //go:cgo_import_dynamic libc_sigaltstack sigaltstack "libc.so"
+
+//go:cgo_import_dynamic libc_issetugid issetugid "libc.so"
 
 //go:cgo_import_dynamic _ _ "libc.so"

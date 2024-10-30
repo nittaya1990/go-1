@@ -2,54 +2,84 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !js
-
 package net
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"internal/testenv"
+	"log"
 	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 )
 
-// testUnixAddr uses os.CreateTemp to get a name that is unique.
-func testUnixAddr() string {
-	f, err := os.CreateTemp("", "go-nettest")
+// testUnixAddr uses os.MkdirTemp to get a name that is unique.
+func testUnixAddr(t testing.TB) string {
+	// Pass an empty pattern to get a directory name that is as short as possible.
+	// If we end up with a name longer than the sun_path field in the sockaddr_un
+	// struct, we won't be able to make the syscall to open the socket.
+	d, err := os.MkdirTemp("", "")
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
-	addr := f.Name()
-	f.Close()
-	os.Remove(addr)
-	return addr
+	t.Cleanup(func() {
+		if err := os.RemoveAll(d); err != nil {
+			t.Error(err)
+		}
+	})
+	return filepath.Join(d, "sock")
 }
 
-func newLocalListener(network string) (Listener, error) {
+func newLocalListener(t testing.TB, network string, lcOpt ...*ListenConfig) Listener {
+	var lc *ListenConfig
+	switch len(lcOpt) {
+	case 0:
+		lc = new(ListenConfig)
+	case 1:
+		lc = lcOpt[0]
+	default:
+		t.Helper()
+		t.Fatal("too many ListenConfigs passed to newLocalListener: want 0 or 1")
+	}
+
+	listen := func(net, addr string) Listener {
+		ln, err := lc.Listen(context.Background(), net, addr)
+		if err != nil {
+			t.Helper()
+			t.Fatal(err)
+		}
+		return ln
+	}
+
 	switch network {
 	case "tcp":
 		if supportsIPv4() {
-			if ln, err := Listen("tcp4", "127.0.0.1:0"); err == nil {
-				return ln, nil
-			}
+			return listen("tcp4", "127.0.0.1:0")
 		}
 		if supportsIPv6() {
-			return Listen("tcp6", "[::1]:0")
+			return listen("tcp6", "[::1]:0")
 		}
 	case "tcp4":
 		if supportsIPv4() {
-			return Listen("tcp4", "127.0.0.1:0")
+			return listen("tcp4", "127.0.0.1:0")
 		}
 	case "tcp6":
 		if supportsIPv6() {
-			return Listen("tcp6", "[::1]:0")
+			return listen("tcp6", "[::1]:0")
 		}
 	case "unix", "unixpacket":
-		return Listen(network, testUnixAddr())
+		return listen(network, testUnixAddr(t))
 	}
-	return nil, fmt.Errorf("%s is not supported", network)
+
+	t.Helper()
+	t.Fatalf("%s is not supported", network)
+	return nil
 }
 
 func newDualStackListener() (lns []*TCPListener, err error) {
@@ -120,12 +150,10 @@ func (ls *localServer) teardown() error {
 	return nil
 }
 
-func newLocalServer(network string) (*localServer, error) {
-	ln, err := newLocalListener(network)
-	if err != nil {
-		return nil, err
-	}
-	return &localServer{Listener: ln, done: make(chan bool)}, nil
+func newLocalServer(t testing.TB, network string) *localServer {
+	t.Helper()
+	ln := newLocalListener(t, network)
+	return &localServer{Listener: ln, done: make(chan bool)}
 }
 
 type streamListener struct {
@@ -134,8 +162,8 @@ type streamListener struct {
 	done chan bool // signal that indicates server stopped
 }
 
-func (sl *streamListener) newLocalServer() (*localServer, error) {
-	return &localServer{Listener: sl.Listener, done: make(chan bool)}, nil
+func (sl *streamListener) newLocalServer() *localServer {
+	return &localServer{Listener: sl.Listener, done: make(chan bool)}
 }
 
 type dualStackServer struct {
@@ -287,75 +315,50 @@ func transceiver(c Conn, wb []byte, ch chan<- error) {
 	}
 }
 
-func timeoutReceiver(c Conn, d, min, max time.Duration, ch chan<- error) {
-	var err error
-	defer func() { ch <- err }()
+func newLocalPacketListener(t testing.TB, network string, lcOpt ...*ListenConfig) PacketConn {
+	var lc *ListenConfig
+	switch len(lcOpt) {
+	case 0:
+		lc = new(ListenConfig)
+	case 1:
+		lc = lcOpt[0]
+	default:
+		t.Helper()
+		t.Fatal("too many ListenConfigs passed to newLocalListener: want 0 or 1")
+	}
 
-	t0 := time.Now()
-	if err = c.SetReadDeadline(time.Now().Add(d)); err != nil {
-		return
-	}
-	b := make([]byte, 256)
-	var n int
-	n, err = c.Read(b)
-	t1 := time.Now()
-	if n != 0 || err == nil || !err.(Error).Timeout() {
-		err = fmt.Errorf("Read did not return (0, timeout): (%d, %v)", n, err)
-		return
-	}
-	if dt := t1.Sub(t0); min > dt || dt > max && !testing.Short() {
-		err = fmt.Errorf("Read took %s; expected %s", dt, d)
-		return
-	}
-}
-
-func timeoutTransmitter(c Conn, d, min, max time.Duration, ch chan<- error) {
-	var err error
-	defer func() { ch <- err }()
-
-	t0 := time.Now()
-	if err = c.SetWriteDeadline(time.Now().Add(d)); err != nil {
-		return
-	}
-	var n int
-	for {
-		n, err = c.Write([]byte("TIMEOUT TRANSMITTER"))
+	listenPacket := func(net, addr string) PacketConn {
+		c, err := lc.ListenPacket(context.Background(), net, addr)
 		if err != nil {
-			break
+			t.Helper()
+			t.Fatal(err)
 		}
+		return c
 	}
-	t1 := time.Now()
-	if err == nil || !err.(Error).Timeout() {
-		err = fmt.Errorf("Write did not return (any, timeout): (%d, %v)", n, err)
-		return
-	}
-	if dt := t1.Sub(t0); min > dt || dt > max && !testing.Short() {
-		err = fmt.Errorf("Write took %s; expected %s", dt, d)
-		return
-	}
-}
 
-func newLocalPacketListener(network string) (PacketConn, error) {
+	t.Helper()
 	switch network {
 	case "udp":
 		if supportsIPv4() {
-			return ListenPacket("udp4", "127.0.0.1:0")
+			return listenPacket("udp4", "127.0.0.1:0")
 		}
 		if supportsIPv6() {
-			return ListenPacket("udp6", "[::1]:0")
+			return listenPacket("udp6", "[::1]:0")
 		}
 	case "udp4":
 		if supportsIPv4() {
-			return ListenPacket("udp4", "127.0.0.1:0")
+			return listenPacket("udp4", "127.0.0.1:0")
 		}
 	case "udp6":
 		if supportsIPv6() {
-			return ListenPacket("udp6", "[::1]:0")
+			return listenPacket("udp6", "[::1]:0")
 		}
 	case "unixgram":
-		return ListenPacket(network, testUnixAddr())
+		return listenPacket(network, testUnixAddr(t))
 	}
-	return nil, fmt.Errorf("%s is not supported", network)
+
+	t.Fatalf("%s is not supported", network)
+	return nil
 }
 
 func newDualStackPacketListener() (cs []*UDPConn, err error) {
@@ -420,20 +423,18 @@ func (ls *localPacketServer) teardown() error {
 	return nil
 }
 
-func newLocalPacketServer(network string) (*localPacketServer, error) {
-	c, err := newLocalPacketListener(network)
-	if err != nil {
-		return nil, err
-	}
-	return &localPacketServer{PacketConn: c, done: make(chan bool)}, nil
+func newLocalPacketServer(t testing.TB, network string) *localPacketServer {
+	t.Helper()
+	c := newLocalPacketListener(t, network)
+	return &localPacketServer{PacketConn: c, done: make(chan bool)}
 }
 
 type packetListener struct {
 	PacketConn
 }
 
-func (pl *packetListener) newLocalServer() (*localPacketServer, error) {
-	return &localPacketServer{PacketConn: pl.PacketConn, done: make(chan bool)}, nil
+func (pl *packetListener) newLocalServer() *localPacketServer {
+	return &localPacketServer{PacketConn: pl.PacketConn, done: make(chan bool)}
 }
 
 func packetTransponder(c PacketConn, ch chan<- error) {
@@ -505,24 +506,126 @@ func packetTransceiver(c PacketConn, wb []byte, dst Addr, ch chan<- error) {
 	}
 }
 
-func timeoutPacketReceiver(c PacketConn, d, min, max time.Duration, ch chan<- error) {
-	var err error
-	defer func() { ch <- err }()
+func spawnTestSocketPair(t testing.TB, net string) (client, server Conn) {
+	t.Helper()
 
-	t0 := time.Now()
-	if err = c.SetReadDeadline(time.Now().Add(d)); err != nil {
+	ln := newLocalListener(t, net)
+	defer ln.Close()
+	var cerr, serr error
+	acceptDone := make(chan struct{})
+	go func() {
+		server, serr = ln.Accept()
+		acceptDone <- struct{}{}
+	}()
+	client, cerr = Dial(ln.Addr().Network(), ln.Addr().String())
+	<-acceptDone
+	if cerr != nil {
+		if server != nil {
+			server.Close()
+		}
+		t.Fatal(cerr)
+	}
+	if serr != nil {
+		if client != nil {
+			client.Close()
+		}
+		t.Fatal(serr)
+	}
+	return client, server
+}
+
+func startTestSocketPeer(t testing.TB, conn Conn, op string, chunkSize, totalSize int) (func(t testing.TB), error) {
+	t.Helper()
+
+	if runtime.GOOS == "windows" {
+		// TODO(panjf2000): Windows has not yet implemented FileConn,
+		//		remove this when it's implemented in https://go.dev/issues/9503.
+		t.Fatalf("startTestSocketPeer is not supported on %s", runtime.GOOS)
+	}
+
+	f, err := conn.(interface{ File() (*os.File, error) }).File()
+	if err != nil {
+		return nil, err
+	}
+
+	cmd := testenv.Command(t, os.Args[0])
+	cmd.Env = []string{
+		"GO_NET_TEST_TRANSFER=1",
+		"GO_NET_TEST_TRANSFER_OP=" + op,
+		"GO_NET_TEST_TRANSFER_CHUNK_SIZE=" + strconv.Itoa(chunkSize),
+		"GO_NET_TEST_TRANSFER_TOTAL_SIZE=" + strconv.Itoa(totalSize),
+		"TMPDIR=" + os.Getenv("TMPDIR"),
+	}
+	cmd.ExtraFiles = append(cmd.ExtraFiles, f)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+
+	cmdCh := make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		conn.Close()
+		f.Close()
+		cmdCh <- err
+	}()
+
+	return func(tb testing.TB) {
+		err := <-cmdCh
+		if err != nil {
+			tb.Errorf("process exited with error: %v", err)
+		}
+	}, nil
+}
+
+func init() {
+	if os.Getenv("GO_NET_TEST_TRANSFER") == "" {
 		return
 	}
-	b := make([]byte, 256)
+	defer os.Exit(0)
+
+	f := os.NewFile(uintptr(3), "splice-test-conn")
+	defer f.Close()
+
+	conn, err := FileConn(f)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var chunkSize int
+	if chunkSize, err = strconv.Atoi(os.Getenv("GO_NET_TEST_TRANSFER_CHUNK_SIZE")); err != nil {
+		log.Fatal(err)
+	}
+	buf := make([]byte, chunkSize)
+
+	var totalSize int
+	if totalSize, err = strconv.Atoi(os.Getenv("GO_NET_TEST_TRANSFER_TOTAL_SIZE")); err != nil {
+		log.Fatal(err)
+	}
+
+	var fn func([]byte) (int, error)
+	switch op := os.Getenv("GO_NET_TEST_TRANSFER_OP"); op {
+	case "r":
+		fn = conn.Read
+	case "w":
+		defer conn.Close()
+
+		fn = conn.Write
+	default:
+		log.Fatalf("unknown op %q", op)
+	}
+
 	var n int
-	n, _, err = c.ReadFrom(b)
-	t1 := time.Now()
-	if n != 0 || err == nil || !err.(Error).Timeout() {
-		err = fmt.Errorf("ReadFrom did not return (0, timeout): (%d, %v)", n, err)
-		return
-	}
-	if dt := t1.Sub(t0); min > dt || dt > max && !testing.Short() {
-		err = fmt.Errorf("ReadFrom took %s; expected %s", dt, d)
-		return
+	for count := 0; count < totalSize; count += n {
+		if count+chunkSize > totalSize {
+			buf = buf[:totalSize-count]
+		}
+
+		var err error
+		if n, err = fn(buf); err != nil {
+			return
+		}
 	}
 }

@@ -12,15 +12,18 @@ import (
 	"fmt"
 	"internal/abi"
 	"internal/profile"
+	"internal/syscall/unix"
 	"internal/testenv"
 	"io"
+	"iter"
 	"math"
 	"math/big"
 	"os"
-	"os/exec"
 	"regexp"
 	"runtime"
 	"runtime/debug"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -79,10 +82,6 @@ func cpuHog2(x int) int {
 	return foo
 }
 
-func cpuHog3(x int) int {
-	return cpuHog0(x, 1e5)
-}
-
 // Return a list of functions that we don't want to ever appear in CPU
 // profiles. For gccgo, that list includes the sigprof handler itself.
 func avoidFunctions() []string {
@@ -93,14 +92,16 @@ func avoidFunctions() []string {
 }
 
 func TestCPUProfile(t *testing.T) {
-	testCPUProfile(t, stackContains, []string{"runtime/pprof.cpuHog1"}, avoidFunctions(), func(dur time.Duration) {
+	matches := matchAndAvoidStacks(stackContains, []string{"runtime/pprof.cpuHog1"}, avoidFunctions())
+	testCPUProfile(t, matches, func(dur time.Duration) {
 		cpuHogger(cpuHog1, &salt1, dur)
 	})
 }
 
 func TestCPUProfileMultithreaded(t *testing.T) {
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(2))
-	testCPUProfile(t, stackContains, []string{"runtime/pprof.cpuHog1", "runtime/pprof.cpuHog2"}, avoidFunctions(), func(dur time.Duration) {
+	matches := matchAndAvoidStacks(stackContains, []string{"runtime/pprof.cpuHog1", "runtime/pprof.cpuHog2"}, avoidFunctions())
+	testCPUProfile(t, matches, func(dur time.Duration) {
 		c := make(chan int)
 		go func() {
 			cpuHogger(cpuHog1, &salt1, dur)
@@ -118,11 +119,8 @@ func TestCPUProfileMultithreadMagnitude(t *testing.T) {
 
 	// Linux [5.9,5.16) has a kernel bug that can break CPU timers on newly
 	// created threads, breaking our CPU accounting.
-	major, minor, patch, err := linuxKernelVersion()
-	if err != nil {
-		t.Errorf("Error determining kernel version: %v", err)
-	}
-	t.Logf("Running on Linux %d.%d.%d", major, minor, patch)
+	major, minor := unix.KernelVersion()
+	t.Logf("Running on Linux %d.%d", major, minor)
 	defer func() {
 		if t.Failed() {
 			t.Logf("Failure of this test may indicate that your system suffers from a known Linux kernel bug fixed on newer kernels. See https://golang.org/issue/49065.")
@@ -156,90 +154,105 @@ func TestCPUProfileMultithreadMagnitude(t *testing.T) {
 		maxDiff = 0.40
 	}
 
-	parallelism := runtime.GOMAXPROCS(0)
+	compare := func(a, b time.Duration, maxDiff float64) error {
+		if a <= 0 || b <= 0 {
+			return fmt.Errorf("Expected both time reports to be positive")
+		}
 
-	// This test compares the process's total CPU time against the CPU
-	// profiler's view of time spent in direct execution of user code.
-	// Background work, especially from the garbage collector, adds noise to
-	// that measurement. Disable automatic triggering of the GC, and then
-	// request a complete GC cycle (up through sweep termination).
-	defer debug.SetGCPercent(debug.SetGCPercent(-1))
-	runtime.GC()
+		if a < b {
+			a, b = b, a
+		}
 
-	var cpuTime1, cpuTimeN time.Duration
-	p := testCPUProfile(t, stackContains, []string{"runtime/pprof.cpuHog1", "runtime/pprof.cpuHog3"}, avoidFunctions(), func(dur time.Duration) {
-		cpuTime1 = diffCPUTime(t, func() {
-			// Consume CPU in one goroutine
-			cpuHogger(cpuHog1, &salt1, dur)
+		diff := float64(a-b) / float64(a)
+		if diff > maxDiff {
+			return fmt.Errorf("CPU usage reports are too different (limit -%.1f%%, got -%.1f%%)", maxDiff*100, diff*100)
+		}
+
+		return nil
+	}
+
+	for _, tc := range []struct {
+		name    string
+		workers int
+	}{
+		{
+			name:    "serial",
+			workers: 1,
+		},
+		{
+			name:    "parallel",
+			workers: runtime.GOMAXPROCS(0),
+		},
+	} {
+		// check that the OS's perspective matches what the Go runtime measures.
+		t.Run(tc.name, func(t *testing.T) {
+			t.Logf("Running with %d workers", tc.workers)
+
+			var userTime, systemTime time.Duration
+			matches := matchAndAvoidStacks(stackContains, []string{"runtime/pprof.cpuHog1"}, avoidFunctions())
+			acceptProfile := func(t *testing.T, p *profile.Profile) bool {
+				if !matches(t, p) {
+					return false
+				}
+
+				ok := true
+				for i, unit := range []string{"count", "nanoseconds"} {
+					if have, want := p.SampleType[i].Unit, unit; have != want {
+						t.Logf("pN SampleType[%d]; %q != %q", i, have, want)
+						ok = false
+					}
+				}
+
+				// cpuHog1 called below is the primary source of CPU
+				// load, but there may be some background work by the
+				// runtime. Since the OS rusage measurement will
+				// include all work done by the process, also compare
+				// against all samples in our profile.
+				var value time.Duration
+				for _, sample := range p.Sample {
+					value += time.Duration(sample.Value[1]) * time.Nanosecond
+				}
+
+				totalTime := userTime + systemTime
+				t.Logf("compare %s user + %s system = %s vs %s", userTime, systemTime, totalTime, value)
+				if err := compare(totalTime, value, maxDiff); err != nil {
+					t.Logf("compare got %v want nil", err)
+					ok = false
+				}
+
+				return ok
+			}
+
+			testCPUProfile(t, acceptProfile, func(dur time.Duration) {
+				userTime, systemTime = diffCPUTime(t, func() {
+					var wg sync.WaitGroup
+					var once sync.Once
+					for i := 0; i < tc.workers; i++ {
+						wg.Add(1)
+						go func() {
+							defer wg.Done()
+							var salt = 0
+							cpuHogger(cpuHog1, &salt, dur)
+							once.Do(func() { salt1 = salt })
+						}()
+					}
+					wg.Wait()
+				})
+			})
 		})
-
-		cpuTimeN = diffCPUTime(t, func() {
-			// Next, consume CPU in several goroutines
-			var wg sync.WaitGroup
-			var once sync.Once
-			for i := 0; i < parallelism; i++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					var salt = 0
-					cpuHogger(cpuHog3, &salt, dur)
-					once.Do(func() { salt1 = salt })
-				}()
-			}
-			wg.Wait()
-		})
-	})
-
-	for i, unit := range []string{"count", "nanoseconds"} {
-		if have, want := p.SampleType[i].Unit, unit; have != want {
-			t.Errorf("pN SampleType[%d]; %q != %q", i, have, want)
-		}
 	}
-
-	var value1, valueN time.Duration
-	for _, sample := range p.Sample {
-		if stackContains("runtime/pprof.cpuHog1", uintptr(sample.Value[0]), sample.Location, sample.Label) {
-			value1 += time.Duration(sample.Value[1]) * time.Nanosecond
-		}
-		if stackContains("runtime/pprof.cpuHog3", uintptr(sample.Value[0]), sample.Location, sample.Label) {
-			valueN += time.Duration(sample.Value[1]) * time.Nanosecond
-		}
-	}
-
-	compare := func(a, b time.Duration, maxDiff float64) func(*testing.T) {
-		return func(t *testing.T) {
-			t.Logf("compare %s vs %s", a, b)
-			if a <= 0 || b <= 0 {
-				t.Errorf("Expected both time reports to be positive")
-				return
-			}
-
-			if a < b {
-				a, b = b, a
-			}
-
-			diff := float64(a-b) / float64(a)
-			if diff > maxDiff {
-				t.Errorf("CPU usage reports are too different (limit -%.1f%%, got -%.1f%%)", maxDiff*100, diff*100)
-			}
-		}
-	}
-
-	// check that the OS's perspective matches what the Go runtime measures
-	t.Run("serial execution OS vs pprof", compare(cpuTime1, value1, maxDiff))
-	t.Run("parallel execution OS vs pprof", compare(cpuTimeN, valueN, maxDiff))
 }
 
 // containsInlinedCall reports whether the function body for the function f is
 // known to contain an inlined function call within the first maxBytes bytes.
-func containsInlinedCall(f interface{}, maxBytes int) bool {
+func containsInlinedCall(f any, maxBytes int) bool {
 	_, found := findInlinedCall(f, maxBytes)
 	return found
 }
 
 // findInlinedCall returns the PC of an inlined function call within
 // the function body for the function f if any.
-func findInlinedCall(f interface{}, maxBytes int) (pc uint64, found bool) {
+func findInlinedCall(f any, maxBytes int) (pc uint64, found bool) {
 	fFunc := runtime.FuncForPC(uintptr(abi.FuncPCABIInternal(f)))
 	if fFunc == nil || fFunc.Entry() == 0 {
 		panic("failed to locate function entry")
@@ -272,7 +285,8 @@ func TestCPUProfileInlining(t *testing.T) {
 		t.Skip("Can't determine whether inlinedCallee was inlined into inlinedCaller.")
 	}
 
-	p := testCPUProfile(t, stackContains, []string{"runtime/pprof.inlinedCallee", "runtime/pprof.inlinedCaller"}, avoidFunctions(), func(dur time.Duration) {
+	matches := matchAndAvoidStacks(stackContains, []string{"runtime/pprof.inlinedCallee", "runtime/pprof.inlinedCaller"}, avoidFunctions())
+	p := testCPUProfile(t, matches, func(dur time.Duration) {
 		cpuHogger(inlinedCaller, &salt1, dur)
 	})
 
@@ -321,8 +335,26 @@ func inlinedCalleeDump(pcs []uintptr) {
 	dumpCallers(pcs)
 }
 
+type inlineWrapperInterface interface {
+	dump(stack []uintptr)
+}
+
+type inlineWrapper struct {
+}
+
+func (h inlineWrapper) dump(pcs []uintptr) {
+	dumpCallers(pcs)
+}
+
+func inlinedWrapperCallerDump(pcs []uintptr) {
+	var h inlineWrapperInterface
+	h = &inlineWrapper{}
+	h.dump(pcs)
+}
+
 func TestCPUProfileRecursion(t *testing.T) {
-	p := testCPUProfile(t, stackContains, []string{"runtime/pprof.inlinedCallee", "runtime/pprof.recursionCallee", "runtime/pprof.recursionCaller"}, avoidFunctions(), func(dur time.Duration) {
+	matches := matchAndAvoidStacks(stackContains, []string{"runtime/pprof.inlinedCallee", "runtime/pprof.recursionCallee", "runtime/pprof.recursionCaller"}, avoidFunctions())
+	p := testCPUProfile(t, matches, func(dur time.Duration) {
 		cpuHogger(recursionCaller, &salt1, dur)
 	})
 
@@ -407,10 +439,10 @@ func cpuProfilingBroken() bool {
 
 // testCPUProfile runs f under the CPU profiler, checking for some conditions specified by need,
 // as interpreted by matches, and returns the parsed profile.
-func testCPUProfile(t *testing.T, matches matchFunc, need []string, avoid []string, f func(dur time.Duration)) *profile.Profile {
+func testCPUProfile(t *testing.T, matches profileMatchFunc, f func(dur time.Duration)) *profile.Profile {
 	switch runtime.GOOS {
 	case "darwin":
-		out, err := exec.Command("uname", "-a").CombinedOutput()
+		out, err := testenv.Command(t, "uname", "-a").CombinedOutput()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -418,14 +450,20 @@ func testCPUProfile(t *testing.T, matches matchFunc, need []string, avoid []stri
 		t.Logf("uname -a: %v", vers)
 	case "plan9":
 		t.Skip("skipping on plan9")
+	case "wasip1":
+		t.Skip("skipping on wasip1")
 	}
 
 	broken := cpuProfilingBroken()
 
-	maxDuration := 5 * time.Second
-	if testing.Short() && broken {
-		// If it's expected to be broken, no point waiting around.
-		maxDuration /= 10
+	deadline, ok := t.Deadline()
+	if broken || !ok {
+		if broken && testing.Short() {
+			// If it's expected to be broken, no point waiting around.
+			deadline = time.Now().Add(1 * time.Second)
+		} else {
+			deadline = time.Now().Add(10 * time.Second)
+		}
 	}
 
 	// If we're running a long test, start with a long duration
@@ -440,7 +478,7 @@ func testCPUProfile(t *testing.T, matches matchFunc, need []string, avoid []stri
 	// several others under go test std. If a test fails in a way
 	// that could mean it just didn't run long enough, try with a
 	// longer duration.
-	for duration <= maxDuration {
+	for {
 		var prof bytes.Buffer
 		if err := StartCPUProfile(&prof); err != nil {
 			t.Fatal(err)
@@ -448,14 +486,15 @@ func testCPUProfile(t *testing.T, matches matchFunc, need []string, avoid []stri
 		f(duration)
 		StopCPUProfile()
 
-		if p, ok := profileOk(t, matches, need, avoid, prof, duration); ok {
+		if p, ok := profileOk(t, matches, prof, duration); ok {
 			return p
 		}
 
 		duration *= 2
-		if duration <= maxDuration {
-			t.Logf("retrying with %s duration", duration)
+		if time.Until(deadline) < duration {
+			break
 		}
+		t.Logf("retrying with %s duration", duration)
 	}
 
 	if broken {
@@ -473,23 +512,14 @@ func testCPUProfile(t *testing.T, matches matchFunc, need []string, avoid []stri
 	return nil
 }
 
-var diffCPUTimeImpl func(f func()) time.Duration
+var diffCPUTimeImpl func(f func()) (user, system time.Duration)
 
-func diffCPUTime(t *testing.T, f func()) time.Duration {
+func diffCPUTime(t *testing.T, f func()) (user, system time.Duration) {
 	if fn := diffCPUTimeImpl; fn != nil {
 		return fn(f)
 	}
 	t.Fatalf("cannot measure CPU time on GOOS=%s GOARCH=%s", runtime.GOOS, runtime.GOARCH)
-	return 0
-}
-
-func contains(slice []string, s string) bool {
-	for i := range slice {
-		if slice[i] == s {
-			return true
-		}
-	}
-	return false
+	return 0, 0
 }
 
 // stackContains matches if a function named spec appears anywhere in the stack trace.
@@ -504,36 +534,18 @@ func stackContains(spec string, count uintptr, stk []*profile.Location, labels m
 	return false
 }
 
-type matchFunc func(spec string, count uintptr, stk []*profile.Location, labels map[string][]string) bool
+type sampleMatchFunc func(spec string, count uintptr, stk []*profile.Location, labels map[string][]string) bool
 
-func profileOk(t *testing.T, matches matchFunc, need []string, avoid []string, prof bytes.Buffer, duration time.Duration) (_ *profile.Profile, ok bool) {
+func profileOk(t *testing.T, matches profileMatchFunc, prof bytes.Buffer, duration time.Duration) (_ *profile.Profile, ok bool) {
 	ok = true
 
-	// Check that profile is well formed, contains 'need', and does not contain
-	// anything from 'avoid'.
-	have := make([]uintptr, len(need))
-	avoidSamples := make([]uintptr, len(avoid))
 	var samples uintptr
-	var buf bytes.Buffer
+	var buf strings.Builder
 	p := parseProfile(t, prof.Bytes(), func(count uintptr, stk []*profile.Location, labels map[string][]string) {
 		fmt.Fprintf(&buf, "%d:", count)
 		fprintStack(&buf, stk)
 		fmt.Fprintf(&buf, " labels: %v\n", labels)
 		samples += count
-		for i, spec := range need {
-			if matches(spec, count, stk, labels) {
-				have[i] += count
-			}
-		}
-		for i, name := range avoid {
-			for _, loc := range stk {
-				for _, line := range loc.Line {
-					if strings.Contains(line.Function.Name, name) {
-						avoidSamples[i] += count
-					}
-				}
-			}
-		}
 		fmt.Fprintf(&buf, "\n")
 	})
 	t.Logf("total %d CPU profile samples collected:\n%s", samples, buf.String())
@@ -556,45 +568,88 @@ func profileOk(t *testing.T, matches matchFunc, need []string, avoid []string, p
 		ok = false
 	}
 
-	for i, name := range avoid {
-		bad := avoidSamples[i]
-		if bad != 0 {
-			t.Logf("found %d samples in avoid-function %s\n", bad, name)
-			ok = false
-		}
-	}
-
-	if len(need) == 0 {
-		return p, ok
-	}
-
-	var total uintptr
-	for i, name := range need {
-		total += have[i]
-		t.Logf("%s: %d\n", name, have[i])
-	}
-	if total == 0 {
-		t.Logf("no samples in expected functions")
+	if matches != nil && !matches(t, p) {
 		ok = false
 	}
-	// We'd like to check a reasonable minimum, like
-	// total / len(have) / smallconstant, but this test is
-	// pretty flaky (see bug 7095).  So we'll just test to
-	// make sure we got at least one sample.
-	min := uintptr(1)
-	for i, name := range need {
-		if have[i] < min {
-			t.Logf("%s has %d samples out of %d, want at least %d, ideally %d", name, have[i], total, min, total/uintptr(len(have)))
+
+	return p, ok
+}
+
+type profileMatchFunc func(*testing.T, *profile.Profile) bool
+
+func matchAndAvoidStacks(matches sampleMatchFunc, need []string, avoid []string) profileMatchFunc {
+	return func(t *testing.T, p *profile.Profile) (ok bool) {
+		ok = true
+
+		// Check that profile is well formed, contains 'need', and does not contain
+		// anything from 'avoid'.
+		have := make([]uintptr, len(need))
+		avoidSamples := make([]uintptr, len(avoid))
+
+		for _, sample := range p.Sample {
+			count := uintptr(sample.Value[0])
+			for i, spec := range need {
+				if matches(spec, count, sample.Location, sample.Label) {
+					have[i] += count
+				}
+			}
+			for i, name := range avoid {
+				for _, loc := range sample.Location {
+					for _, line := range loc.Line {
+						if strings.Contains(line.Function.Name, name) {
+							avoidSamples[i] += count
+						}
+					}
+				}
+			}
+		}
+
+		for i, name := range avoid {
+			bad := avoidSamples[i]
+			if bad != 0 {
+				t.Logf("found %d samples in avoid-function %s\n", bad, name)
+				ok = false
+			}
+		}
+
+		if len(need) == 0 {
+			return
+		}
+
+		var total uintptr
+		for i, name := range need {
+			total += have[i]
+			t.Logf("found %d samples in expected function %s\n", have[i], name)
+		}
+		if total == 0 {
+			t.Logf("no samples in expected functions")
 			ok = false
 		}
+
+		// We'd like to check a reasonable minimum, like
+		// total / len(have) / smallconstant, but this test is
+		// pretty flaky (see bug 7095).  So we'll just test to
+		// make sure we got at least one sample.
+		min := uintptr(1)
+		for i, name := range need {
+			if have[i] < min {
+				t.Logf("%s has %d samples out of %d, want at least %d, ideally %d", name, have[i], total, min, total/uintptr(len(have)))
+				ok = false
+			}
+		}
+		return
 	}
-	return p, ok
 }
 
 // Fork can hang if preempted with signals frequently enough (see issue 5517).
 // Ensure that we do not do this.
 func TestCPUProfileWithFork(t *testing.T) {
 	testenv.MustHaveExec(t)
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	heap := 1 << 30
 	if runtime.GOOS == "android" {
@@ -627,7 +682,7 @@ func TestCPUProfileWithFork(t *testing.T) {
 	defer StopCPUProfile()
 
 	for i := 0; i < 10; i++ {
-		exec.Command(os.Args[0], "-h").CombinedOutput()
+		testenv.Command(t, exe, "-h").CombinedOutput()
 	}
 }
 
@@ -680,7 +735,7 @@ func TestGoroutineSwitch(t *testing.T) {
 			// The place we'd see it would be the inner most frame.
 			name := stk[0].Line[0].Function.Name
 			if name == "gogo" {
-				var buf bytes.Buffer
+				var buf strings.Builder
 				fprintStack(&buf, stk)
 				t.Fatalf("found profile entry for gogo:\n%s", buf.String())
 			}
@@ -689,6 +744,9 @@ func TestGoroutineSwitch(t *testing.T) {
 }
 
 func fprintStack(w io.Writer, stk []*profile.Location) {
+	if len(stk) == 0 {
+		fmt.Fprintf(w, " (stack empty)")
+	}
 	for _, loc := range stk {
 		fmt.Fprintf(w, " %#x", loc.Address)
 		fmt.Fprintf(w, " (")
@@ -704,7 +762,7 @@ func fprintStack(w io.Writer, stk []*profile.Location) {
 
 // Test that profiling of division operations is okay, especially on ARM. See issue 6681.
 func TestMathBigDivide(t *testing.T) {
-	testCPUProfile(t, nil, nil, nil, func(duration time.Duration) {
+	testCPUProfile(t, nil, func(duration time.Duration) {
 		t := time.After(duration)
 		pi := new(big.Int)
 		for {
@@ -733,7 +791,8 @@ func stackContainsAll(spec string, count uintptr, stk []*profile.Location, label
 }
 
 func TestMorestack(t *testing.T) {
-	testCPUProfile(t, stackContainsAll, []string{"runtime.newstack,runtime/pprof.growstack"}, avoidFunctions(), func(duration time.Duration) {
+	matches := matchAndAvoidStacks(stackContainsAll, []string{"runtime.newstack,runtime/pprof.growstack"}, avoidFunctions())
+	testCPUProfile(t, matches, func(duration time.Duration) {
 		t := time.After(duration)
 		c := make(chan bool)
 		for {
@@ -770,7 +829,7 @@ func use(x [8 << 18]byte) {}
 func TestBlockProfile(t *testing.T) {
 	type TestCase struct {
 		name string
-		f    func()
+		f    func(*testing.T)
 		stk  []string
 		re   string
 	}
@@ -785,9 +844,9 @@ func TestBlockProfile(t *testing.T) {
 			},
 			re: `
 [0-9]+ [0-9]+ @( 0x[[:xdigit:]]+)+
-#	0x[0-9a-f]+	runtime\.chanrecv1\+0x[0-9a-f]+	.*/src/runtime/chan.go:[0-9]+
-#	0x[0-9a-f]+	runtime/pprof\.blockChanRecv\+0x[0-9a-f]+	.*/src/runtime/pprof/pprof_test.go:[0-9]+
-#	0x[0-9a-f]+	runtime/pprof\.TestBlockProfile\+0x[0-9a-f]+	.*/src/runtime/pprof/pprof_test.go:[0-9]+
+#	0x[0-9a-f]+	runtime\.chanrecv1\+0x[0-9a-f]+	.*runtime/chan.go:[0-9]+
+#	0x[0-9a-f]+	runtime/pprof\.blockChanRecv\+0x[0-9a-f]+	.*runtime/pprof/pprof_test.go:[0-9]+
+#	0x[0-9a-f]+	runtime/pprof\.TestBlockProfile\+0x[0-9a-f]+	.*runtime/pprof/pprof_test.go:[0-9]+
 `},
 		{
 			name: "chan send",
@@ -799,9 +858,9 @@ func TestBlockProfile(t *testing.T) {
 			},
 			re: `
 [0-9]+ [0-9]+ @( 0x[[:xdigit:]]+)+
-#	0x[0-9a-f]+	runtime\.chansend1\+0x[0-9a-f]+	.*/src/runtime/chan.go:[0-9]+
-#	0x[0-9a-f]+	runtime/pprof\.blockChanSend\+0x[0-9a-f]+	.*/src/runtime/pprof/pprof_test.go:[0-9]+
-#	0x[0-9a-f]+	runtime/pprof\.TestBlockProfile\+0x[0-9a-f]+	.*/src/runtime/pprof/pprof_test.go:[0-9]+
+#	0x[0-9a-f]+	runtime\.chansend1\+0x[0-9a-f]+	.*runtime/chan.go:[0-9]+
+#	0x[0-9a-f]+	runtime/pprof\.blockChanSend\+0x[0-9a-f]+	.*runtime/pprof/pprof_test.go:[0-9]+
+#	0x[0-9a-f]+	runtime/pprof\.TestBlockProfile\+0x[0-9a-f]+	.*runtime/pprof/pprof_test.go:[0-9]+
 `},
 		{
 			name: "chan close",
@@ -813,9 +872,9 @@ func TestBlockProfile(t *testing.T) {
 			},
 			re: `
 [0-9]+ [0-9]+ @( 0x[[:xdigit:]]+)+
-#	0x[0-9a-f]+	runtime\.chanrecv1\+0x[0-9a-f]+	.*/src/runtime/chan.go:[0-9]+
-#	0x[0-9a-f]+	runtime/pprof\.blockChanClose\+0x[0-9a-f]+	.*/src/runtime/pprof/pprof_test.go:[0-9]+
-#	0x[0-9a-f]+	runtime/pprof\.TestBlockProfile\+0x[0-9a-f]+	.*/src/runtime/pprof/pprof_test.go:[0-9]+
+#	0x[0-9a-f]+	runtime\.chanrecv1\+0x[0-9a-f]+	.*runtime/chan.go:[0-9]+
+#	0x[0-9a-f]+	runtime/pprof\.blockChanClose\+0x[0-9a-f]+	.*runtime/pprof/pprof_test.go:[0-9]+
+#	0x[0-9a-f]+	runtime/pprof\.TestBlockProfile\+0x[0-9a-f]+	.*runtime/pprof/pprof_test.go:[0-9]+
 `},
 		{
 			name: "select recv async",
@@ -827,9 +886,9 @@ func TestBlockProfile(t *testing.T) {
 			},
 			re: `
 [0-9]+ [0-9]+ @( 0x[[:xdigit:]]+)+
-#	0x[0-9a-f]+	runtime\.selectgo\+0x[0-9a-f]+	.*/src/runtime/select.go:[0-9]+
-#	0x[0-9a-f]+	runtime/pprof\.blockSelectRecvAsync\+0x[0-9a-f]+	.*/src/runtime/pprof/pprof_test.go:[0-9]+
-#	0x[0-9a-f]+	runtime/pprof\.TestBlockProfile\+0x[0-9a-f]+	.*/src/runtime/pprof/pprof_test.go:[0-9]+
+#	0x[0-9a-f]+	runtime\.selectgo\+0x[0-9a-f]+	.*runtime/select.go:[0-9]+
+#	0x[0-9a-f]+	runtime/pprof\.blockSelectRecvAsync\+0x[0-9a-f]+	.*runtime/pprof/pprof_test.go:[0-9]+
+#	0x[0-9a-f]+	runtime/pprof\.TestBlockProfile\+0x[0-9a-f]+	.*runtime/pprof/pprof_test.go:[0-9]+
 `},
 		{
 			name: "select send sync",
@@ -841,9 +900,9 @@ func TestBlockProfile(t *testing.T) {
 			},
 			re: `
 [0-9]+ [0-9]+ @( 0x[[:xdigit:]]+)+
-#	0x[0-9a-f]+	runtime\.selectgo\+0x[0-9a-f]+	.*/src/runtime/select.go:[0-9]+
-#	0x[0-9a-f]+	runtime/pprof\.blockSelectSendSync\+0x[0-9a-f]+	.*/src/runtime/pprof/pprof_test.go:[0-9]+
-#	0x[0-9a-f]+	runtime/pprof\.TestBlockProfile\+0x[0-9a-f]+	.*/src/runtime/pprof/pprof_test.go:[0-9]+
+#	0x[0-9a-f]+	runtime\.selectgo\+0x[0-9a-f]+	.*runtime/select.go:[0-9]+
+#	0x[0-9a-f]+	runtime/pprof\.blockSelectSendSync\+0x[0-9a-f]+	.*runtime/pprof/pprof_test.go:[0-9]+
+#	0x[0-9a-f]+	runtime/pprof\.TestBlockProfile\+0x[0-9a-f]+	.*runtime/pprof/pprof_test.go:[0-9]+
 `},
 		{
 			name: "mutex",
@@ -855,9 +914,9 @@ func TestBlockProfile(t *testing.T) {
 			},
 			re: `
 [0-9]+ [0-9]+ @( 0x[[:xdigit:]]+)+
-#	0x[0-9a-f]+	sync\.\(\*Mutex\)\.Lock\+0x[0-9a-f]+	.*/src/sync/mutex\.go:[0-9]+
-#	0x[0-9a-f]+	runtime/pprof\.blockMutex\+0x[0-9a-f]+	.*/src/runtime/pprof/pprof_test.go:[0-9]+
-#	0x[0-9a-f]+	runtime/pprof\.TestBlockProfile\+0x[0-9a-f]+	.*/src/runtime/pprof/pprof_test.go:[0-9]+
+#	0x[0-9a-f]+	sync\.\(\*Mutex\)\.Lock\+0x[0-9a-f]+	.*sync/mutex\.go:[0-9]+
+#	0x[0-9a-f]+	runtime/pprof\.blockMutex\+0x[0-9a-f]+	.*runtime/pprof/pprof_test.go:[0-9]+
+#	0x[0-9a-f]+	runtime/pprof\.TestBlockProfile\+0x[0-9a-f]+	.*runtime/pprof/pprof_test.go:[0-9]+
 `},
 		{
 			name: "cond",
@@ -869,9 +928,9 @@ func TestBlockProfile(t *testing.T) {
 			},
 			re: `
 [0-9]+ [0-9]+ @( 0x[[:xdigit:]]+)+
-#	0x[0-9a-f]+	sync\.\(\*Cond\)\.Wait\+0x[0-9a-f]+	.*/src/sync/cond\.go:[0-9]+
-#	0x[0-9a-f]+	runtime/pprof\.blockCond\+0x[0-9a-f]+	.*/src/runtime/pprof/pprof_test.go:[0-9]+
-#	0x[0-9a-f]+	runtime/pprof\.TestBlockProfile\+0x[0-9a-f]+	.*/src/runtime/pprof/pprof_test.go:[0-9]+
+#	0x[0-9a-f]+	sync\.\(\*Cond\)\.Wait\+0x[0-9a-f]+	.*sync/cond\.go:[0-9]+
+#	0x[0-9a-f]+	runtime/pprof\.blockCond\+0x[0-9a-f]+	.*runtime/pprof/pprof_test.go:[0-9]+
+#	0x[0-9a-f]+	runtime/pprof\.TestBlockProfile\+0x[0-9a-f]+	.*runtime/pprof/pprof_test.go:[0-9]+
 `},
 	}
 
@@ -879,11 +938,11 @@ func TestBlockProfile(t *testing.T) {
 	runtime.SetBlockProfileRate(1)
 	defer runtime.SetBlockProfileRate(0)
 	for _, test := range tests {
-		test.f()
+		test.f(t)
 	}
 
 	t.Run("debug=1", func(t *testing.T) {
-		var w bytes.Buffer
+		var w strings.Builder
 		Lookup("block").WriteTo(&w, 1)
 		prof := w.String()
 
@@ -915,7 +974,7 @@ func TestBlockProfile(t *testing.T) {
 			t.Fatalf("invalid profile: %v", err)
 		}
 
-		stks := stacks(p)
+		stks := profileStacks(p)
 		for _, test := range tests {
 			if !containsStack(stks, test.stk) {
 				t.Errorf("No matching stack entry for %v, want %+v", test.name, test.stk)
@@ -925,12 +984,28 @@ func TestBlockProfile(t *testing.T) {
 
 }
 
-func stacks(p *profile.Profile) (res [][]string) {
+func profileStacks(p *profile.Profile) (res [][]string) {
 	for _, s := range p.Sample {
 		var stk []string
 		for _, l := range s.Location {
 			for _, line := range l.Line {
 				stk = append(stk, line.Function.Name)
+			}
+		}
+		res = append(res, stk)
+	}
+	return res
+}
+
+func blockRecordStacks(records []runtime.BlockProfileRecord) (res [][]string) {
+	for _, record := range records {
+		frames := runtime.CallersFrames(record.Stack())
+		var stk []string
+		for {
+			frame, more := frames.Next()
+			stk = append(stk, frame.Function)
+			if !more {
+				break
 			}
 		}
 		res = append(res, stk)
@@ -955,42 +1030,73 @@ func containsStack(got [][]string, want []string) bool {
 	return false
 }
 
-const blockDelay = 10 * time.Millisecond
+// awaitBlockedGoroutine spins on runtime.Gosched until a runtime stack dump
+// shows a goroutine in the given state with a stack frame in
+// runtime/pprof.<fName>.
+func awaitBlockedGoroutine(t *testing.T, state, fName string, count int) {
+	re := fmt.Sprintf(`(?m)^goroutine \d+ \[%s\]:\n(?:.+\n\t.+\n)*runtime/pprof\.%s`, regexp.QuoteMeta(state), fName)
+	r := regexp.MustCompile(re)
 
-func blockChanRecv() {
+	if deadline, ok := t.Deadline(); ok {
+		if d := time.Until(deadline); d > 1*time.Second {
+			timer := time.AfterFunc(d-1*time.Second, func() {
+				debug.SetTraceback("all")
+				panic(fmt.Sprintf("timed out waiting for %#q", re))
+			})
+			defer timer.Stop()
+		}
+	}
+
+	buf := make([]byte, 64<<10)
+	for {
+		runtime.Gosched()
+		n := runtime.Stack(buf, true)
+		if n == len(buf) {
+			// Buffer wasn't large enough for a full goroutine dump.
+			// Resize it and try again.
+			buf = make([]byte, 2*len(buf))
+			continue
+		}
+		if len(r.FindAll(buf[:n], -1)) >= count {
+			return
+		}
+	}
+}
+
+func blockChanRecv(t *testing.T) {
 	c := make(chan bool)
 	go func() {
-		time.Sleep(blockDelay)
+		awaitBlockedGoroutine(t, "chan receive", "blockChanRecv", 1)
 		c <- true
 	}()
 	<-c
 }
 
-func blockChanSend() {
+func blockChanSend(t *testing.T) {
 	c := make(chan bool)
 	go func() {
-		time.Sleep(blockDelay)
+		awaitBlockedGoroutine(t, "chan send", "blockChanSend", 1)
 		<-c
 	}()
 	c <- true
 }
 
-func blockChanClose() {
+func blockChanClose(t *testing.T) {
 	c := make(chan bool)
 	go func() {
-		time.Sleep(blockDelay)
+		awaitBlockedGoroutine(t, "chan receive", "blockChanClose", 1)
 		close(c)
 	}()
 	<-c
 }
 
-func blockSelectRecvAsync() {
+func blockSelectRecvAsync(t *testing.T) {
 	const numTries = 3
 	c := make(chan bool, 1)
 	c2 := make(chan bool, 1)
 	go func() {
 		for i := 0; i < numTries; i++ {
-			time.Sleep(blockDelay)
+			awaitBlockedGoroutine(t, "select", "blockSelectRecvAsync", 1)
 			c <- true
 		}
 	}()
@@ -1002,11 +1108,11 @@ func blockSelectRecvAsync() {
 	}
 }
 
-func blockSelectSendSync() {
+func blockSelectSendSync(t *testing.T) {
 	c := make(chan bool)
 	c2 := make(chan bool)
 	go func() {
-		time.Sleep(blockDelay)
+		awaitBlockedGoroutine(t, "select", "blockSelectSendSync", 1)
 		<-c
 	}()
 	select {
@@ -1015,11 +1121,11 @@ func blockSelectSendSync() {
 	}
 }
 
-func blockMutex() {
+func blockMutex(t *testing.T) {
 	var mu sync.Mutex
 	mu.Lock()
 	go func() {
-		time.Sleep(blockDelay)
+		awaitBlockedGoroutine(t, "sync.Mutex.Lock", "blockMutex", 1)
 		mu.Unlock()
 	}()
 	// Note: Unlock releases mu before recording the mutex event,
@@ -1029,12 +1135,36 @@ func blockMutex() {
 	mu.Lock()
 }
 
-func blockCond() {
+func blockMutexN(t *testing.T, n int, d time.Duration) {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	mu.Lock()
+	go func() {
+		awaitBlockedGoroutine(t, "sync.Mutex.Lock", "blockMutex", n)
+		time.Sleep(d)
+		mu.Unlock()
+	}()
+	// Note: Unlock releases mu before recording the mutex event,
+	// so it's theoretically possible for this to proceed and
+	// capture the profile before the event is recorded. As long
+	// as this is blocked before the unlock happens, it's okay.
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mu.Lock()
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+}
+
+func blockCond(t *testing.T) {
 	var mu sync.Mutex
 	c := sync.NewCond(&mu)
 	mu.Lock()
 	go func() {
-		time.Sleep(blockDelay)
+		awaitBlockedGoroutine(t, "sync.Cond.Wait", "blockCond", 1)
 		mu.Lock()
 		c.Signal()
 		mu.Unlock()
@@ -1108,6 +1238,7 @@ func blockInfrequentLong(rate int) {
 }
 
 // Used by TestBlockProfileBias.
+//
 //go:linkname blockevent runtime.blockevent
 func blockevent(cycles int64, skip int)
 
@@ -1120,10 +1251,16 @@ func TestMutexProfile(t *testing.T) {
 		t.Fatalf("need MutexProfileRate 0, got %d", old)
 	}
 
-	blockMutex()
+	const (
+		N = 100
+		D = 100 * time.Millisecond
+	)
+	start := time.Now()
+	blockMutexN(t, N, D)
+	blockMutexNTime := time.Since(start)
 
 	t.Run("debug=1", func(t *testing.T) {
-		var w bytes.Buffer
+		var w strings.Builder
 		Lookup("mutex").WriteTo(&w, 1)
 		prof := w.String()
 		t.Logf("received profile: %v", prof)
@@ -1133,15 +1270,11 @@ func TestMutexProfile(t *testing.T) {
 		}
 		prof = strings.Trim(prof, "\n")
 		lines := strings.Split(prof, "\n")
-		if len(lines) != 6 {
-			t.Errorf("expected 6 lines, got %d %q\n%s", len(lines), prof, prof)
-		}
 		if len(lines) < 6 {
-			return
+			t.Fatalf("expected >=6 lines, got %d %q\n%s", len(lines), prof, prof)
 		}
 		// checking that the line is like "35258904 1 @ 0x48288d 0x47cd28 0x458931"
 		r2 := `^\d+ \d+ @(?: 0x[[:xdigit:]]+)+`
-		//r2 := "^[0-9]+ 1 @ 0x[0-9a-f x]+$"
 		if ok, err := regexp.MatchString(r2, lines[3]); err != nil || !ok {
 			t.Errorf("%q didn't match %q", lines[3], r2)
 		}
@@ -1149,7 +1282,7 @@ func TestMutexProfile(t *testing.T) {
 		if ok, err := regexp.MatchString(r3, lines[5]); err != nil || !ok {
 			t.Errorf("%q didn't match %q", lines[5], r3)
 		}
-		t.Logf(prof)
+		t.Log(prof)
 	})
 	t.Run("proto", func(t *testing.T) {
 		// proto format
@@ -1164,15 +1297,119 @@ func TestMutexProfile(t *testing.T) {
 			t.Fatalf("invalid profile: %v", err)
 		}
 
-		stks := stacks(p)
+		stks := profileStacks(p)
 		for _, want := range [][]string{
-			{"sync.(*Mutex).Unlock", "runtime/pprof.blockMutex.func1"},
+			{"sync.(*Mutex).Unlock", "runtime/pprof.blockMutexN.func1"},
 		} {
 			if !containsStack(stks, want) {
 				t.Errorf("No matching stack entry for %+v", want)
 			}
 		}
+
+		i := 0
+		for ; i < len(p.SampleType); i++ {
+			if p.SampleType[i].Unit == "nanoseconds" {
+				break
+			}
+		}
+		if i >= len(p.SampleType) {
+			t.Fatalf("profile did not contain nanoseconds sample")
+		}
+		total := int64(0)
+		for _, s := range p.Sample {
+			total += s.Value[i]
+		}
+		// Want d to be at least N*D, but give some wiggle-room to avoid
+		// a test flaking. Set an upper-bound proportional to the total
+		// wall time spent in blockMutexN. Generally speaking, the total
+		// contention time could be arbitrarily high when considering
+		// OS scheduler delays, or any other delays from the environment:
+		// time keeps ticking during these delays. By making the upper
+		// bound proportional to the wall time in blockMutexN, in theory
+		// we're accounting for all these possible delays.
+		d := time.Duration(total)
+		lo := time.Duration(N * D * 9 / 10)
+		hi := time.Duration(N) * blockMutexNTime * 11 / 10
+		if d < lo || d > hi {
+			for _, s := range p.Sample {
+				t.Logf("sample: %s", time.Duration(s.Value[i]))
+			}
+			t.Fatalf("profile samples total %v, want within range [%v, %v] (target: %v)", d, lo, hi, N*D)
+		}
 	})
+
+	t.Run("records", func(t *testing.T) {
+		// Record a mutex profile using the structured record API.
+		var records []runtime.BlockProfileRecord
+		for {
+			n, ok := runtime.MutexProfile(records)
+			if ok {
+				records = records[:n]
+				break
+			}
+			records = make([]runtime.BlockProfileRecord, n*2)
+		}
+
+		// Check that we see the same stack trace as the proto profile. For
+		// historical reason we expect a runtime.goexit root frame here that is
+		// omitted in the proto profile.
+		stks := blockRecordStacks(records)
+		want := []string{"sync.(*Mutex).Unlock", "runtime/pprof.blockMutexN.func1", "runtime.goexit"}
+		if !containsStack(stks, want) {
+			t.Errorf("No matching stack entry for %+v", want)
+		}
+	})
+}
+
+func TestMutexProfileRateAdjust(t *testing.T) {
+	old := runtime.SetMutexProfileFraction(1)
+	defer runtime.SetMutexProfileFraction(old)
+	if old != 0 {
+		t.Fatalf("need MutexProfileRate 0, got %d", old)
+	}
+
+	readProfile := func() (contentions int64, delay int64) {
+		var w bytes.Buffer
+		Lookup("mutex").WriteTo(&w, 0)
+		p, err := profile.Parse(&w)
+		if err != nil {
+			t.Fatalf("failed to parse profile: %v", err)
+		}
+		t.Logf("parsed proto: %s", p)
+		if err := p.CheckValid(); err != nil {
+			t.Fatalf("invalid profile: %v", err)
+		}
+
+		for _, s := range p.Sample {
+			var match, runtimeInternal bool
+			for _, l := range s.Location {
+				for _, line := range l.Line {
+					if line.Function.Name == "runtime/pprof.blockMutex.func1" {
+						match = true
+					}
+					if line.Function.Name == "runtime.unlock" {
+						runtimeInternal = true
+					}
+				}
+			}
+			if match && !runtimeInternal {
+				contentions += s.Value[0]
+				delay += s.Value[1]
+			}
+		}
+		return
+	}
+
+	blockMutex(t)
+	contentions, delay := readProfile()
+	if contentions == 0 { // low-resolution timers can have delay of 0 in mutex profile
+		t.Fatal("did not see expected function in profile")
+	}
+	runtime.SetMutexProfileFraction(0)
+	newContentions, newDelay := readProfile()
+	if newContentions != contentions || newDelay != delay {
+		t.Fatalf("sample value changed: got [%d, %d], want [%d, %d]", newContentions, newDelay, contentions, delay)
+	}
 }
 
 func func1(c chan int) { <-c }
@@ -1221,6 +1458,23 @@ func TestGoroutineCounts(t *testing.T) {
 		}
 	})
 
+	SetGoroutineLabels(WithLabels(context.Background(), Labels("self-label", "self-value")))
+	defer SetGoroutineLabels(context.Background())
+
+	garbage := new(*int)
+	fingReady := make(chan struct{})
+	runtime.SetFinalizer(garbage, func(v **int) {
+		Do(context.Background(), Labels("fing-label", "fing-value"), func(ctx context.Context) {
+			close(fingReady)
+			<-c
+		})
+	})
+	garbage = nil
+	for i := 0; i < 2; i++ {
+		runtime.GC()
+	}
+	<-fingReady
+
 	var w bytes.Buffer
 	goroutineProf := Lookup("goroutine")
 
@@ -1230,8 +1484,22 @@ func TestGoroutineCounts(t *testing.T) {
 
 	labels := labelMap{"label": "value"}
 	labelStr := "\n# labels: " + labels.String()
-	if !containsInOrder(prof, "\n50 @ ", "\n44 @", labelStr,
-		"\n40 @", "\n36 @", labelStr, "\n10 @", "\n9 @", labelStr, "\n1 @") {
+	selfLabel := labelMap{"self-label": "self-value"}
+	selfLabelStr := "\n# labels: " + selfLabel.String()
+	fingLabel := labelMap{"fing-label": "fing-value"}
+	fingLabelStr := "\n# labels: " + fingLabel.String()
+	orderedPrefix := []string{
+		"\n50 @ ",
+		"\n44 @", labelStr,
+		"\n40 @",
+		"\n36 @", labelStr,
+		"\n10 @",
+		"\n9 @", labelStr,
+		"\n1 @"}
+	if !containsInOrder(prof, append(orderedPrefix, selfLabelStr)...) {
+		t.Errorf("expected sorted goroutine counts with Labels:\n%s", prof)
+	}
+	if !containsInOrder(prof, append(orderedPrefix, fingLabelStr)...) {
 		t.Errorf("expected sorted goroutine counts with Labels:\n%s", prof)
 	}
 
@@ -1246,13 +1514,13 @@ func TestGoroutineCounts(t *testing.T) {
 		t.Errorf("protobuf profile is invalid: %v", err)
 	}
 	expectedLabels := map[int64]map[string]string{
-		50: map[string]string{},
-		44: map[string]string{"label": "value"},
-		40: map[string]string{},
-		36: map[string]string{"label": "value"},
-		10: map[string]string{},
-		9:  map[string]string{"label": "value"},
-		1:  map[string]string{},
+		50: {},
+		44: {"label": "value"},
+		40: {},
+		36: {"label": "value"},
+		10: {},
+		9:  {"label": "value"},
+		1:  {"self-label": "self-value", "fing-label": "fing-value"},
 	}
 	if !containsCountsLabels(p, expectedLabels) {
 		t.Errorf("expected count profile to contain goroutines with counts and labels %v, got %v",
@@ -1321,6 +1589,333 @@ func containsCountsLabels(prof *profile.Profile, countLabels map[int64]map[strin
 	return true
 }
 
+func TestGoroutineProfileConcurrency(t *testing.T) {
+	testenv.MustHaveParallelism(t)
+
+	goroutineProf := Lookup("goroutine")
+
+	profilerCalls := func(s string) int {
+		return strings.Count(s, "\truntime/pprof.runtime_goroutineProfileWithLabels+")
+	}
+
+	includesFinalizer := func(s string) bool {
+		return strings.Contains(s, "runtime.runfinq")
+	}
+
+	// Concurrent calls to the goroutine profiler should not trigger data races
+	// or corruption.
+	t.Run("overlapping profile requests", func(t *testing.T) {
+		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		var wg sync.WaitGroup
+		for i := 0; i < 2; i++ {
+			wg.Add(1)
+			Do(ctx, Labels("i", fmt.Sprint(i)), func(context.Context) {
+				go func() {
+					defer wg.Done()
+					for ctx.Err() == nil {
+						var w strings.Builder
+						goroutineProf.WriteTo(&w, 1)
+						prof := w.String()
+						count := profilerCalls(prof)
+						if count >= 2 {
+							t.Logf("prof %d\n%s", count, prof)
+							cancel()
+						}
+					}
+				}()
+			})
+		}
+		wg.Wait()
+	})
+
+	// The finalizer goroutine should not show up in most profiles, since it's
+	// marked as a system goroutine when idle.
+	t.Run("finalizer not present", func(t *testing.T) {
+		var w strings.Builder
+		goroutineProf.WriteTo(&w, 1)
+		prof := w.String()
+		if includesFinalizer(prof) {
+			t.Errorf("profile includes finalizer (but finalizer should be marked as system):\n%s", prof)
+		}
+	})
+
+	// The finalizer goroutine should show up when it's running user code.
+	t.Run("finalizer present", func(t *testing.T) {
+		// T is a pointer type so it won't be allocated by the tiny
+		// allocator, which can lead to its finalizer not being called
+		// during this test
+		type T *byte
+		obj := new(T)
+		ch1, ch2 := make(chan int), make(chan int)
+		defer close(ch2)
+		runtime.SetFinalizer(obj, func(_ interface{}) {
+			close(ch1)
+			<-ch2
+		})
+		obj = nil
+		for i := 10; i >= 0; i-- {
+			select {
+			case <-ch1:
+			default:
+				if i == 0 {
+					t.Fatalf("finalizer did not run")
+				}
+				runtime.GC()
+			}
+		}
+		var w strings.Builder
+		goroutineProf.WriteTo(&w, 1)
+		prof := w.String()
+		if !includesFinalizer(prof) {
+			t.Errorf("profile does not include finalizer (and it should be marked as user):\n%s", prof)
+		}
+	})
+
+	// Check that new goroutines only show up in order.
+	testLaunches := func(t *testing.T) {
+		var done sync.WaitGroup
+		defer done.Wait()
+
+		ctx := context.Background()
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		ch := make(chan int)
+		defer close(ch)
+
+		var ready sync.WaitGroup
+
+		// These goroutines all survive until the end of the subtest, so we can
+		// check that a (numbered) goroutine appearing in the profile implies
+		// that all older goroutines also appear in the profile.
+		ready.Add(1)
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			for i := 0; ctx.Err() == nil; i++ {
+				// Use SetGoroutineLabels rather than Do we can always expect an
+				// extra goroutine (this one) with most recent label.
+				SetGoroutineLabels(WithLabels(ctx, Labels(t.Name()+"-loop-i", fmt.Sprint(i))))
+				done.Add(1)
+				go func() {
+					<-ch
+					done.Done()
+				}()
+				for j := 0; j < i; j++ {
+					// Spin for longer and longer as the test goes on. This
+					// goroutine will do O(N^2) work with the number of
+					// goroutines it launches. This should be slow relative to
+					// the work involved in collecting a goroutine profile,
+					// which is O(N) with the high-water mark of the number of
+					// goroutines in this process (in the allgs slice).
+					runtime.Gosched()
+				}
+				if i == 0 {
+					ready.Done()
+				}
+			}
+		}()
+
+		// Short-lived goroutines exercise different code paths (goroutines with
+		// status _Gdead, for instance). This churn doesn't have behavior that
+		// we can test directly, but does help to shake out data races.
+		ready.Add(1)
+		var churn func(i int)
+		churn = func(i int) {
+			SetGoroutineLabels(WithLabels(ctx, Labels(t.Name()+"-churn-i", fmt.Sprint(i))))
+			if i == 0 {
+				ready.Done()
+			} else if i%16 == 0 {
+				// Yield on occasion so this sequence of goroutine launches
+				// doesn't monopolize a P. See issue #52934.
+				runtime.Gosched()
+			}
+			if ctx.Err() == nil {
+				go churn(i + 1)
+			}
+		}
+		go func() {
+			churn(0)
+		}()
+
+		ready.Wait()
+
+		var w [3]bytes.Buffer
+		for i := range w {
+			goroutineProf.WriteTo(&w[i], 0)
+		}
+		for i := range w {
+			p, err := profile.Parse(bytes.NewReader(w[i].Bytes()))
+			if err != nil {
+				t.Errorf("error parsing protobuf profile: %v", err)
+			}
+
+			// High-numbered loop-i goroutines imply that every lower-numbered
+			// loop-i goroutine should be present in the profile too.
+			counts := make(map[string]int)
+			for _, s := range p.Sample {
+				label := s.Label[t.Name()+"-loop-i"]
+				if len(label) > 0 {
+					counts[label[0]]++
+				}
+			}
+			for j, max := 0, len(counts)-1; j <= max; j++ {
+				n := counts[fmt.Sprint(j)]
+				if n == 1 || (n == 2 && j == max) {
+					continue
+				}
+				t.Errorf("profile #%d's goroutines with label loop-i:%d; %d != 1 (or 2 for the last entry, %d)",
+					i+1, j, n, max)
+				t.Logf("counts %v", counts)
+				break
+			}
+		}
+	}
+
+	runs := 100
+	if testing.Short() {
+		runs = 5
+	}
+	for i := 0; i < runs; i++ {
+		// Run multiple times to shake out data races
+		t.Run("goroutine launches", testLaunches)
+	}
+}
+
+// Regression test for #69998.
+func TestGoroutineProfileCoro(t *testing.T) {
+	testenv.MustHaveParallelism(t)
+
+	goroutineProf := Lookup("goroutine")
+
+	// Set up a goroutine to just create and run coroutine goroutines all day.
+	iterFunc := func() {
+		p, stop := iter.Pull2(
+			func(yield func(int, int) bool) {
+				for i := 0; i < 10000; i++ {
+					if !yield(i, i) {
+						return
+					}
+				}
+			},
+		)
+		defer stop()
+		for {
+			_, _, ok := p()
+			if !ok {
+				break
+			}
+		}
+	}
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			iterFunc()
+			select {
+			case <-done:
+			default:
+			}
+		}
+	}()
+
+	// Take a goroutine profile. If the bug in #69998 is present, this will crash
+	// with high probability. We don't care about the output for this bug.
+	goroutineProf.WriteTo(io.Discard, 1)
+}
+
+func BenchmarkGoroutine(b *testing.B) {
+	withIdle := func(n int, fn func(b *testing.B)) func(b *testing.B) {
+		return func(b *testing.B) {
+			c := make(chan int)
+			var ready, done sync.WaitGroup
+			defer func() {
+				close(c)
+				done.Wait()
+			}()
+
+			for i := 0; i < n; i++ {
+				ready.Add(1)
+				done.Add(1)
+				go func() {
+					ready.Done()
+					<-c
+					done.Done()
+				}()
+			}
+			// Let goroutines block on channel
+			ready.Wait()
+			for i := 0; i < 5; i++ {
+				runtime.Gosched()
+			}
+
+			fn(b)
+		}
+	}
+
+	withChurn := func(fn func(b *testing.B)) func(b *testing.B) {
+		return func(b *testing.B) {
+			ctx := context.Background()
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			var ready sync.WaitGroup
+			ready.Add(1)
+			var count int64
+			var churn func(i int)
+			churn = func(i int) {
+				SetGoroutineLabels(WithLabels(ctx, Labels("churn-i", fmt.Sprint(i))))
+				atomic.AddInt64(&count, 1)
+				if i == 0 {
+					ready.Done()
+				}
+				if ctx.Err() == nil {
+					go churn(i + 1)
+				}
+			}
+			go func() {
+				churn(0)
+			}()
+			ready.Wait()
+
+			fn(b)
+			b.ReportMetric(float64(atomic.LoadInt64(&count))/float64(b.N), "concurrent_launches/op")
+		}
+	}
+
+	benchWriteTo := func(b *testing.B) {
+		goroutineProf := Lookup("goroutine")
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			goroutineProf.WriteTo(io.Discard, 0)
+		}
+		b.StopTimer()
+	}
+
+	benchGoroutineProfile := func(b *testing.B) {
+		p := make([]runtime.StackRecord, 10000)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			runtime.GoroutineProfile(p)
+		}
+		b.StopTimer()
+	}
+
+	// Note that some costs of collecting a goroutine profile depend on the
+	// length of the runtime.allgs slice, which never shrinks. Stay within race
+	// detector's 8k-goroutine limit
+	for _, n := range []int{50, 500, 5000} {
+		b.Run(fmt.Sprintf("Profile.WriteTo idle %d", n), withIdle(n, benchWriteTo))
+		b.Run(fmt.Sprintf("Profile.WriteTo churn %d", n), withIdle(n, withChurn(benchWriteTo)))
+		b.Run(fmt.Sprintf("runtime.GoroutineProfile churn %d", n), withIdle(n, withChurn(benchGoroutineProfile)))
+	}
+}
+
 var emptyCallStackTestRun int64
 
 // Issue 18836.
@@ -1329,7 +1924,7 @@ func TestEmptyCallStack(t *testing.T) {
 	emptyCallStackTestRun++
 
 	t.Parallel()
-	var buf bytes.Buffer
+	var buf strings.Builder
 	p := NewProfile(name)
 
 	p.Add("foo", 47674)
@@ -1357,14 +1952,15 @@ func stackContainsLabeled(spec string, count uintptr, stk []*profile.Location, l
 	if !ok {
 		panic("missing = in key/value spec")
 	}
-	if !contains(labels[k], v) {
+	if !slices.Contains(labels[k], v) {
 		return false
 	}
 	return stackContains(base, count, stk, labels)
 }
 
 func TestCPUProfileLabel(t *testing.T) {
-	testCPUProfile(t, stackContainsLabeled, []string{"runtime/pprof.cpuHogger;key=value"}, avoidFunctions(), func(dur time.Duration) {
+	matches := matchAndAvoidStacks(stackContainsLabeled, []string{"runtime/pprof.cpuHogger;key=value"}, avoidFunctions())
+	testCPUProfile(t, matches, func(dur time.Duration) {
 		Do(context.Background(), Labels("key", "value"), func(context.Context) {
 			cpuHogger(cpuHog1, &salt1, dur)
 		})
@@ -1372,10 +1968,12 @@ func TestCPUProfileLabel(t *testing.T) {
 }
 
 func TestLabelRace(t *testing.T) {
+	testenv.MustHaveParallelism(t)
 	// Test the race detector annotations for synchronization
-	// between settings labels and consuming them from the
+	// between setting labels and consuming them from the
 	// profile.
-	testCPUProfile(t, stackContainsLabeled, []string{"runtime/pprof.cpuHogger;key=value"}, nil, func(dur time.Duration) {
+	matches := matchAndAvoidStacks(stackContainsLabeled, []string{"runtime/pprof.cpuHogger;key=value"}, nil)
+	testCPUProfile(t, matches, func(dur time.Duration) {
 		start := time.Now()
 		var wg sync.WaitGroup
 		for time.Since(start) < dur {
@@ -1392,6 +1990,187 @@ func TestLabelRace(t *testing.T) {
 			wg.Wait()
 		}
 	})
+}
+
+func TestGoroutineProfileLabelRace(t *testing.T) {
+	testenv.MustHaveParallelism(t)
+	// Test the race detector annotations for synchronization
+	// between setting labels and consuming them from the
+	// goroutine profile. See issue #50292.
+
+	t.Run("reset", func(t *testing.T) {
+		ctx := context.Background()
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		go func() {
+			goroutineProf := Lookup("goroutine")
+			for ctx.Err() == nil {
+				var w strings.Builder
+				goroutineProf.WriteTo(&w, 1)
+				prof := w.String()
+				if strings.Contains(prof, "loop-i") {
+					cancel()
+				}
+			}
+		}()
+
+		for i := 0; ctx.Err() == nil; i++ {
+			Do(ctx, Labels("loop-i", fmt.Sprint(i)), func(ctx context.Context) {
+			})
+		}
+	})
+
+	t.Run("churn", func(t *testing.T) {
+		ctx := context.Background()
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		var ready sync.WaitGroup
+		ready.Add(1)
+		var churn func(i int)
+		churn = func(i int) {
+			SetGoroutineLabels(WithLabels(ctx, Labels("churn-i", fmt.Sprint(i))))
+			if i == 0 {
+				ready.Done()
+			}
+			if ctx.Err() == nil {
+				go churn(i + 1)
+			}
+		}
+		go func() {
+			churn(0)
+		}()
+		ready.Wait()
+
+		goroutineProf := Lookup("goroutine")
+		for i := 0; i < 10; i++ {
+			goroutineProf.WriteTo(io.Discard, 1)
+		}
+	})
+}
+
+// TestLabelSystemstack makes sure CPU profiler samples of goroutines running
+// on systemstack include the correct pprof labels. See issue #48577
+func TestLabelSystemstack(t *testing.T) {
+	// Grab and re-set the initial value before continuing to ensure
+	// GOGC doesn't actually change following the test.
+	gogc := debug.SetGCPercent(100)
+	debug.SetGCPercent(gogc)
+
+	matches := matchAndAvoidStacks(stackContainsLabeled, []string{"runtime.systemstack;key=value"}, avoidFunctions())
+	p := testCPUProfile(t, matches, func(dur time.Duration) {
+		Do(context.Background(), Labels("key", "value"), func(ctx context.Context) {
+			parallelLabelHog(ctx, dur, gogc)
+		})
+	})
+
+	// Two conditions to check:
+	// * labelHog should always be labeled.
+	// * The label should _only_ appear on labelHog and the Do call above.
+	for _, s := range p.Sample {
+		isLabeled := s.Label != nil && slices.Contains(s.Label["key"], "value")
+		var (
+			mayBeLabeled     bool
+			mustBeLabeled    string
+			mustNotBeLabeled string
+		)
+		for _, loc := range s.Location {
+			for _, l := range loc.Line {
+				switch l.Function.Name {
+				case "runtime/pprof.labelHog", "runtime/pprof.parallelLabelHog", "runtime/pprof.parallelLabelHog.func1":
+					mustBeLabeled = l.Function.Name
+				case "runtime/pprof.Do":
+					// Do sets the labels, so samples may
+					// or may not be labeled depending on
+					// which part of the function they are
+					// at.
+					mayBeLabeled = true
+				case "runtime.bgsweep", "runtime.bgscavenge", "runtime.forcegchelper", "runtime.gcBgMarkWorker", "runtime.runfinq", "runtime.sysmon":
+					// Runtime system goroutines or threads
+					// (such as those identified by
+					// runtime.isSystemGoroutine). These
+					// should never be labeled.
+					mustNotBeLabeled = l.Function.Name
+				case "gogo", "gosave_systemstack_switch", "racecall":
+					// These are context switch/race
+					// critical that we can't do a full
+					// traceback from. Typically this would
+					// be covered by the runtime check
+					// below, but these symbols don't have
+					// the package name.
+					mayBeLabeled = true
+				}
+
+				if strings.HasPrefix(l.Function.Name, "runtime.") {
+					// There are many places in the runtime
+					// where we can't do a full traceback.
+					// Ideally we'd list them all, but
+					// barring that allow anything in the
+					// runtime, unless explicitly excluded
+					// above.
+					mayBeLabeled = true
+				}
+			}
+		}
+		errorStack := func(f string, args ...any) {
+			var buf strings.Builder
+			fprintStack(&buf, s.Location)
+			t.Errorf("%s: %s", fmt.Sprintf(f, args...), buf.String())
+		}
+		if mustBeLabeled != "" && mustNotBeLabeled != "" {
+			errorStack("sample contains both %s, which must be labeled, and %s, which must not be labeled", mustBeLabeled, mustNotBeLabeled)
+			continue
+		}
+		if mustBeLabeled != "" || mustNotBeLabeled != "" {
+			// We found a definitive frame, so mayBeLabeled hints are not relevant.
+			mayBeLabeled = false
+		}
+		if mayBeLabeled {
+			// This sample may or may not be labeled, so there's nothing we can check.
+			continue
+		}
+		if mustBeLabeled != "" && !isLabeled {
+			errorStack("sample must be labeled because of %s, but is not", mustBeLabeled)
+		}
+		if mustNotBeLabeled != "" && isLabeled {
+			errorStack("sample must not be labeled because of %s, but is", mustNotBeLabeled)
+		}
+	}
+}
+
+// labelHog is designed to burn CPU time in a way that a high number of CPU
+// samples end up running on systemstack.
+func labelHog(stop chan struct{}, gogc int) {
+	// Regression test for issue 50032. We must give GC an opportunity to
+	// be initially triggered by a labelled goroutine.
+	runtime.GC()
+
+	for i := 0; ; i++ {
+		select {
+		case <-stop:
+			return
+		default:
+			debug.SetGCPercent(gogc)
+		}
+	}
+}
+
+// parallelLabelHog runs GOMAXPROCS goroutines running labelHog.
+func parallelLabelHog(ctx context.Context, dur time.Duration, gogc int) {
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < runtime.GOMAXPROCS(0); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			labelHog(stop, gogc)
+		}()
+	}
+
+	time.Sleep(dur)
+	close(stop)
+	wg.Wait()
 }
 
 // Check that there is no deadlock when the program receives SIGPROF while in
@@ -1477,6 +2256,8 @@ func TestTryAdd(t *testing.T) {
 	for i := range pcs {
 		inlinedCallerStack[i] = uint64(pcs[i])
 	}
+	wrapperPCs := make([]uintptr, 1)
+	inlinedWrapperCallerDump(wrapperPCs)
 
 	if _, found := findInlinedCall(recursionChainBottom, 4<<10); !found {
 		t.Skip("Can't determine whether anything was inlined into recursionChainBottom.")
@@ -1500,6 +2281,7 @@ func TestTryAdd(t *testing.T) {
 	testCases := []struct {
 		name        string
 		input       []uint64          // following the input format assumed by profileBuilder.addCPUData.
+		count       int               // number of records in input.
 		wantLocs    [][]string        // ordered location entries with function names.
 		wantSamples []*profile.Sample // ordered samples, we care only about Value and the profile location IDs.
 	}{{
@@ -1509,6 +2291,7 @@ func TestTryAdd(t *testing.T) {
 			3, 0, 500, // hz = 500. Must match the period.
 			5, 0, 50, inlinedCallerStack[0], inlinedCallerStack[1],
 		},
+		count: 2,
 		wantLocs: [][]string{
 			{"runtime/pprof.inlinedCalleeDump", "runtime/pprof.inlinedCallerDump"},
 		},
@@ -1525,6 +2308,7 @@ func TestTryAdd(t *testing.T) {
 			7, 0, 10, inlinedCallerStack[0], inlinedCallerStack[1], inlinedCallerStack[0], inlinedCallerStack[1],
 			5, 0, 20, inlinedCallerStack[0], inlinedCallerStack[1],
 		},
+		count:    3,
 		wantLocs: [][]string{{"runtime/pprof.inlinedCalleeDump", "runtime/pprof.inlinedCallerDump"}},
 		wantSamples: []*profile.Sample{
 			{Value: []int64{10, 10 * period}, Location: []*profile.Location{{ID: 1}, {ID: 1}}},
@@ -1538,6 +2322,7 @@ func TestTryAdd(t *testing.T) {
 			// entry. The "stk" entry is actually the count.
 			4, 0, 0, 4242,
 		},
+		count:    2,
 		wantLocs: [][]string{{"runtime/pprof.lostProfileEvent"}},
 		wantSamples: []*profile.Sample{
 			{Value: []int64{4242, 4242 * period}, Location: []*profile.Location{{ID: 1}}},
@@ -1556,6 +2341,7 @@ func TestTryAdd(t *testing.T) {
 			5, 0, 30, inlinedCallerStack[0], inlinedCallerStack[0],
 			4, 0, 40, inlinedCallerStack[0],
 		},
+		count: 3,
 		// inlinedCallerDump shows up here because
 		// runtime_expandFinalInlineFrame adds it to the stack frame.
 		wantLocs: [][]string{{"runtime/pprof.inlinedCalleeDump"}, {"runtime/pprof.inlinedCallerDump"}},
@@ -1569,6 +2355,7 @@ func TestTryAdd(t *testing.T) {
 			3, 0, 500, // hz = 500. Must match the period.
 			9, 0, 10, recursionStack[0], recursionStack[1], recursionStack[2], recursionStack[3], recursionStack[4], recursionStack[5],
 		},
+		count: 2,
 		wantLocs: [][]string{
 			{"runtime/pprof.recursionChainBottom"},
 			{
@@ -1592,6 +2379,7 @@ func TestTryAdd(t *testing.T) {
 			5, 0, 50, inlinedCallerStack[0], inlinedCallerStack[1],
 			4, 0, 60, inlinedCallerStack[0],
 		},
+		count:    3,
 		wantLocs: [][]string{{"runtime/pprof.inlinedCalleeDump", "runtime/pprof.inlinedCallerDump"}},
 		wantSamples: []*profile.Sample{
 			{Value: []int64{50, 50 * period}, Location: []*profile.Location{{ID: 1}}},
@@ -1604,6 +2392,7 @@ func TestTryAdd(t *testing.T) {
 			4, 0, 70, inlinedCallerStack[0],
 			5, 0, 80, inlinedCallerStack[0], inlinedCallerStack[1],
 		},
+		count:    3,
 		wantLocs: [][]string{{"runtime/pprof.inlinedCalleeDump", "runtime/pprof.inlinedCallerDump"}},
 		wantSamples: []*profile.Sample{
 			{Value: []int64{70, 70 * period}, Location: []*profile.Location{{ID: 1}}},
@@ -1616,6 +2405,7 @@ func TestTryAdd(t *testing.T) {
 			3, 0, 500, // hz = 500. Must match the period.
 			4, 0, 70, inlinedCallerStack[0],
 		},
+		count:    2,
 		wantLocs: [][]string{{"runtime/pprof.inlinedCalleeDump", "runtime/pprof.inlinedCallerDump"}},
 		wantSamples: []*profile.Sample{
 			{Value: []int64{70, 70 * period}, Location: []*profile.Location{{ID: 1}}},
@@ -1631,6 +2421,7 @@ func TestTryAdd(t *testing.T) {
 			// from getting merged into above.
 			5, 0, 80, inlinedCallerStack[1], inlinedCallerStack[0],
 		},
+		count: 3,
 		wantLocs: [][]string{
 			{"runtime/pprof.inlinedCalleeDump", "runtime/pprof.inlinedCallerDump"},
 			{"runtime/pprof.inlinedCallerDump"},
@@ -1639,11 +2430,22 @@ func TestTryAdd(t *testing.T) {
 			{Value: []int64{70, 70 * period}, Location: []*profile.Location{{ID: 1}}},
 			{Value: []int64{80, 80 * period}, Location: []*profile.Location{{ID: 2}, {ID: 1}}},
 		},
+	}, {
+		name: "expand_wrapper_function",
+		input: []uint64{
+			3, 0, 500, // hz = 500. Must match the period.
+			4, 0, 50, uint64(wrapperPCs[0]),
+		},
+		count:    2,
+		wantLocs: [][]string{{"runtime/pprof.inlineWrapper.dump"}},
+		wantSamples: []*profile.Sample{
+			{Value: []int64{50, 50 * period}, Location: []*profile.Location{{ID: 1}}},
+		},
 	}}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			p, err := translateCPUProfile(tc.input)
+			p, err := translateCPUProfile(tc.input, tc.count)
 			if err != nil {
 				t.Fatalf("translating profile: %v", err)
 			}
@@ -1686,7 +2488,8 @@ func TestTimeVDSO(t *testing.T) {
 		testenv.SkipFlaky(t, 48655)
 	}
 
-	p := testCPUProfile(t, stackContains, []string{"time.now"}, avoidFunctions(), func(dur time.Duration) {
+	matches := matchAndAvoidStacks(stackContains, []string{"time.now"}, avoidFunctions())
+	p := testCPUProfile(t, matches, func(dur time.Duration) {
 		t0 := time.Now()
 		for {
 			t := time.Now()
@@ -1709,5 +2512,380 @@ func TestTimeVDSO(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestProfilerStackDepth(t *testing.T) {
+	t.Cleanup(disableSampling())
+
+	const depth = 128
+	go produceProfileEvents(t, depth)
+	awaitBlockedGoroutine(t, "chan receive", "goroutineDeep", 1)
+
+	tests := []struct {
+		profiler string
+		prefix   []string
+	}{
+		{"heap", []string{"runtime/pprof.allocDeep"}},
+		{"block", []string{"runtime.chanrecv1", "runtime/pprof.blockChanDeep"}},
+		{"mutex", []string{"sync.(*Mutex).Unlock", "runtime/pprof.blockMutexDeep"}},
+		{"goroutine", []string{"runtime.gopark", "runtime.chanrecv", "runtime.chanrecv1", "runtime/pprof.goroutineDeep"}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.profiler, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := Lookup(test.profiler).WriteTo(&buf, 0); err != nil {
+				t.Fatalf("failed to write heap profile: %v", err)
+			}
+			p, err := profile.Parse(&buf)
+			if err != nil {
+				t.Fatalf("failed to parse heap profile: %v", err)
+			}
+			t.Logf("Profile = %v", p)
+
+			stks := profileStacks(p)
+			var stk []string
+			for _, s := range stks {
+				if hasPrefix(s, test.prefix) {
+					stk = s
+					break
+				}
+			}
+			if len(stk) != depth {
+				t.Fatalf("want stack depth = %d, got %d", depth, len(stk))
+			}
+
+			if rootFn, wantFn := stk[depth-1], "runtime/pprof.produceProfileEvents"; rootFn != wantFn {
+				t.Fatalf("want stack stack root %s, got %v", wantFn, rootFn)
+			}
+		})
+	}
+}
+
+func hasPrefix(stk []string, prefix []string) bool {
+	if len(prefix) > len(stk) {
+		return false
+	}
+	for i := range prefix {
+		if stk[i] != prefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ensure that stack records are valid map keys (comparable)
+var _ = map[runtime.MemProfileRecord]struct{}{}
+var _ = map[runtime.StackRecord]struct{}{}
+
+// allocDeep calls itself n times before calling fn.
+func allocDeep(n int) {
+	if n > 1 {
+		allocDeep(n - 1)
+		return
+	}
+	memSink = make([]byte, 1<<20)
+}
+
+// blockChanDeep produces a block profile event at stack depth n, including the
+// caller.
+func blockChanDeep(t *testing.T, n int) {
+	if n > 1 {
+		blockChanDeep(t, n-1)
+		return
+	}
+	ch := make(chan struct{})
+	go func() {
+		awaitBlockedGoroutine(t, "chan receive", "blockChanDeep", 1)
+		ch <- struct{}{}
+	}()
+	<-ch
+}
+
+// blockMutexDeep produces a block profile event at stack depth n, including the
+// caller.
+func blockMutexDeep(t *testing.T, n int) {
+	if n > 1 {
+		blockMutexDeep(t, n-1)
+		return
+	}
+	var mu sync.Mutex
+	go func() {
+		mu.Lock()
+		mu.Lock()
+	}()
+	awaitBlockedGoroutine(t, "sync.Mutex.Lock", "blockMutexDeep", 1)
+	mu.Unlock()
+}
+
+// goroutineDeep blocks at stack depth n, including the caller until the test is
+// finished.
+func goroutineDeep(t *testing.T, n int) {
+	if n > 1 {
+		goroutineDeep(t, n-1)
+		return
+	}
+	wait := make(chan struct{}, 1)
+	t.Cleanup(func() {
+		wait <- struct{}{}
+	})
+	<-wait
+}
+
+// produceProfileEvents produces pprof events at the given stack depth and then
+// blocks in goroutineDeep until the test completes. The stack traces are
+// guaranteed to have exactly the desired depth with produceProfileEvents as
+// their root frame which is expected by TestProfilerStackDepth.
+func produceProfileEvents(t *testing.T, depth int) {
+	allocDeep(depth - 1)       // -1 for produceProfileEvents, **
+	blockChanDeep(t, depth-2)  // -2 for produceProfileEvents, **, chanrecv1
+	blockMutexDeep(t, depth-2) // -2 for produceProfileEvents, **, Unlock
+	memSink = nil
+	runtime.GC()
+	goroutineDeep(t, depth-4) // -4 for produceProfileEvents, **, chanrecv1, chanrev, gopark
+}
+
+func getProfileStacks(collect func([]runtime.BlockProfileRecord) (int, bool), fileLine bool) []string {
+	var n int
+	var ok bool
+	var p []runtime.BlockProfileRecord
+	for {
+		p = make([]runtime.BlockProfileRecord, n)
+		n, ok = collect(p)
+		if ok {
+			p = p[:n]
+			break
+		}
+	}
+	var stacks []string
+	for _, r := range p {
+		var stack strings.Builder
+		for i, pc := range r.Stack() {
+			if i > 0 {
+				stack.WriteByte('\n')
+			}
+			// Use FuncForPC instead of CallersFrames,
+			// because we want to see the info for exactly
+			// the PCs returned by the mutex profile to
+			// ensure inlined calls have already been properly
+			// expanded.
+			f := runtime.FuncForPC(pc - 1)
+			stack.WriteString(f.Name())
+			if fileLine {
+				stack.WriteByte(' ')
+				file, line := f.FileLine(pc - 1)
+				stack.WriteString(file)
+				stack.WriteByte(':')
+				stack.WriteString(strconv.Itoa(line))
+			}
+		}
+		stacks = append(stacks, stack.String())
+	}
+	return stacks
+}
+
+func TestMutexBlockFullAggregation(t *testing.T) {
+	// This regression test is adapted from
+	// https://github.com/grafana/pyroscope-go/issues/103,
+	// authored by Tolya Korniltsev
+
+	var m sync.Mutex
+
+	prev := runtime.SetMutexProfileFraction(-1)
+	defer runtime.SetMutexProfileFraction(prev)
+
+	const fraction = 1
+	const iters = 100
+	const workers = 2
+
+	runtime.SetMutexProfileFraction(fraction)
+	runtime.SetBlockProfileRate(1)
+	defer runtime.SetBlockProfileRate(0)
+
+	wg := sync.WaitGroup{}
+	wg.Add(workers)
+	for j := 0; j < workers; j++ {
+		go func() {
+			for i := 0; i < iters; i++ {
+				m.Lock()
+				// Wait at least 1 millisecond to pass the
+				// starvation threshold for the mutex
+				time.Sleep(time.Millisecond)
+				m.Unlock()
+			}
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+
+	assertNoDuplicates := func(name string, collect func([]runtime.BlockProfileRecord) (int, bool)) {
+		stacks := getProfileStacks(collect, true)
+		seen := make(map[string]struct{})
+		for _, s := range stacks {
+			if _, ok := seen[s]; ok {
+				t.Errorf("saw duplicate entry in %s profile with stack:\n%s", name, s)
+			}
+			seen[s] = struct{}{}
+		}
+		if len(seen) == 0 {
+			t.Errorf("did not see any samples in %s profile for this test", name)
+		}
+	}
+	t.Run("mutex", func(t *testing.T) {
+		assertNoDuplicates("mutex", runtime.MutexProfile)
+	})
+	t.Run("block", func(t *testing.T) {
+		assertNoDuplicates("block", runtime.BlockProfile)
+	})
+}
+
+func inlineA(mu *sync.Mutex, wg *sync.WaitGroup) { inlineB(mu, wg) }
+func inlineB(mu *sync.Mutex, wg *sync.WaitGroup) { inlineC(mu, wg) }
+func inlineC(mu *sync.Mutex, wg *sync.WaitGroup) {
+	defer wg.Done()
+	mu.Lock()
+	mu.Unlock()
+}
+
+func inlineD(mu *sync.Mutex, wg *sync.WaitGroup) { inlineE(mu, wg) }
+func inlineE(mu *sync.Mutex, wg *sync.WaitGroup) { inlineF(mu, wg) }
+func inlineF(mu *sync.Mutex, wg *sync.WaitGroup) {
+	defer wg.Done()
+	mu.Unlock()
+}
+
+func TestBlockMutexProfileInlineExpansion(t *testing.T) {
+	runtime.SetBlockProfileRate(1)
+	defer runtime.SetBlockProfileRate(0)
+	prev := runtime.SetMutexProfileFraction(1)
+	defer runtime.SetMutexProfileFraction(prev)
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	wg.Add(2)
+	mu.Lock()
+	go inlineA(&mu, &wg)
+	awaitBlockedGoroutine(t, "sync.Mutex.Lock", "inlineC", 1)
+	// inlineD will unblock inlineA
+	go inlineD(&mu, &wg)
+	wg.Wait()
+
+	tcs := []struct {
+		Name     string
+		Collect  func([]runtime.BlockProfileRecord) (int, bool)
+		SubStack string
+	}{
+		{
+			Name:    "mutex",
+			Collect: runtime.MutexProfile,
+			SubStack: `sync.(*Mutex).Unlock
+runtime/pprof.inlineF
+runtime/pprof.inlineE
+runtime/pprof.inlineD`,
+		},
+		{
+			Name:    "block",
+			Collect: runtime.BlockProfile,
+			SubStack: `sync.(*Mutex).Lock
+runtime/pprof.inlineC
+runtime/pprof.inlineB
+runtime/pprof.inlineA`,
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.Name, func(t *testing.T) {
+			stacks := getProfileStacks(tc.Collect, false)
+			for _, s := range stacks {
+				if strings.Contains(s, tc.SubStack) {
+					return
+				}
+			}
+			t.Error("did not see expected stack")
+			t.Logf("wanted:\n%s", tc.SubStack)
+			t.Logf("got: %s", stacks)
+		})
+	}
+}
+
+func TestProfileRecordNullPadding(t *testing.T) {
+	// Produce events for the different profile types.
+	t.Cleanup(disableSampling())
+	memSink = make([]byte, 1)      // MemProfile
+	<-time.After(time.Millisecond) // BlockProfile
+	blockMutex(t)                  // MutexProfile
+	runtime.GC()
+
+	// Test that all profile records are null padded.
+	testProfileRecordNullPadding(t, "MutexProfile", runtime.MutexProfile)
+	testProfileRecordNullPadding(t, "GoroutineProfile", runtime.GoroutineProfile)
+	testProfileRecordNullPadding(t, "BlockProfile", runtime.BlockProfile)
+	testProfileRecordNullPadding(t, "MemProfile/inUseZero=true", func(p []runtime.MemProfileRecord) (int, bool) {
+		return runtime.MemProfile(p, true)
+	})
+	testProfileRecordNullPadding(t, "MemProfile/inUseZero=false", func(p []runtime.MemProfileRecord) (int, bool) {
+		return runtime.MemProfile(p, false)
+	})
+	// Not testing ThreadCreateProfile because it is broken, see issue 6104.
+}
+
+func testProfileRecordNullPadding[T runtime.StackRecord | runtime.MemProfileRecord | runtime.BlockProfileRecord](t *testing.T, name string, fn func([]T) (int, bool)) {
+	stack0 := func(sr *T) *[32]uintptr {
+		switch t := any(sr).(type) {
+		case *runtime.StackRecord:
+			return &t.Stack0
+		case *runtime.MemProfileRecord:
+			return &t.Stack0
+		case *runtime.BlockProfileRecord:
+			return &t.Stack0
+		default:
+			panic(fmt.Sprintf("unexpected type %T", sr))
+		}
+	}
+
+	t.Run(name, func(t *testing.T) {
+		var p []T
+		for {
+			n, ok := fn(p)
+			if ok {
+				p = p[:n]
+				break
+			}
+			p = make([]T, n*2)
+			for i := range p {
+				s0 := stack0(&p[i])
+				for j := range s0 {
+					// Poison the Stack0 array to identify lack of zero padding
+					s0[j] = ^uintptr(0)
+				}
+			}
+		}
+
+		if len(p) == 0 {
+			t.Fatal("no records found")
+		}
+
+		for _, sr := range p {
+			for i, v := range stack0(&sr) {
+				if v == ^uintptr(0) {
+					t.Fatalf("record p[%d].Stack0 is not null padded: %+v", i, sr)
+				}
+			}
+		}
+	})
+}
+
+// disableSampling configures the profilers to capture all events, otherwise
+// it's difficult to assert anything.
+func disableSampling() func() {
+	oldMemRate := runtime.MemProfileRate
+	runtime.MemProfileRate = 1
+	runtime.SetBlockProfileRate(1)
+	oldMutexRate := runtime.SetMutexProfileFraction(1)
+	return func() {
+		runtime.MemProfileRate = oldMemRate
+		runtime.SetBlockProfileRate(0)
+		runtime.SetMutexProfileFraction(oldMutexRate)
 	}
 }

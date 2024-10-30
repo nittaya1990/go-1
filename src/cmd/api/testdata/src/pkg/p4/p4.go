@@ -4,12 +4,12 @@
 
 package p4
 
-type Pair[T1 interface { M() }, T2 ~int] struct {
+type Pair[T1 interface{ M() }, T2 ~int] struct {
 	f1 T1
 	f2 T2
 }
 
-func NewPair[T1 interface { M() }, T2 ~int](v1 T1, v2 T2) Pair[T1, T2] {
+func NewPair[T1 interface{ M() }, T2 ~int](v1 T1, v2 T2) Pair[T1, T2] {
 	return Pair[T1, T2]{f1: v1, f2: v2}
 }
 
@@ -21,6 +21,7 @@ func (p Pair[_, X2]) Second() X2 {
 	return p.f2
 }
 
+// Deprecated: Use something else.
 func Clone[S ~[]T, T any](s S) S {
 	return append(S(nil), s...)
 }

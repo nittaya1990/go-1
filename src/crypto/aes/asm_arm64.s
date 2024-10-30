@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !purego
+
 #include "textflag.h"
 DATA rotInvSRows<>+0x00(SB)/8, $0x080f0205040b0e01
 DATA rotInvSRows<>+0x08(SB)/8, $0x00070a0d0c030609
@@ -20,14 +22,14 @@ TEXT ·encryptBlockAsm(SB),NOSPLIT,$0
 
 	CMP	$12, R9
 	BLT	enc128
-	BEQ	enc196
+	BEQ	enc192
 enc256:
 	VLD1.P	32(R10), [V1.B16, V2.B16]
 	AESE	V1.B16, V0.B16
 	AESMC	V0.B16, V0.B16
 	AESE	V2.B16, V0.B16
 	AESMC	V0.B16, V0.B16
-enc196:
+enc192:
 	VLD1.P	32(R10), [V3.B16, V4.B16]
 	AESE	V3.B16, V0.B16
 	AESMC	V0.B16, V0.B16
@@ -71,14 +73,14 @@ TEXT ·decryptBlockAsm(SB),NOSPLIT,$0
 
 	CMP	$12, R9
 	BLT	dec128
-	BEQ	dec196
+	BEQ	dec192
 dec256:
 	VLD1.P	32(R10), [V1.B16, V2.B16]
 	AESD	V1.B16, V0.B16
 	AESIMC	V0.B16, V0.B16
 	AESD	V2.B16, V0.B16
 	AESIMC	V0.B16, V0.B16
-dec196:
+dec192:
 	VLD1.P	32(R10), [V3.B16, V4.B16]
 	AESD	V3.B16, V0.B16
 	AESIMC	V0.B16, V0.B16
@@ -149,7 +151,7 @@ ks128Loop:
 	BNE	ks128Loop
 	CBZ	R11, ksDone       // If dec is nil we are done
 	SUB	$176, R10
-        // Decryption keys are encryption keys with InverseMixColumns applied
+	// Decryption keys are encryption keys with InverseMixColumns applied
 	VLD1.P	64(R10), [V0.B16, V1.B16, V2.B16, V3.B16]
 	VMOV	V0.B16, V7.B16
 	AESIMC	V1.B16, V6.B16

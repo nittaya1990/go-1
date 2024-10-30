@@ -253,6 +253,18 @@ func ExampleURL_IsAbs() {
 	// true
 }
 
+func ExampleURL_JoinPath() {
+	u, err := url.Parse("https://example.com/foo/bar")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println(u.JoinPath("baz", "qux"))
+
+	// Output:
+	// https://example.com/foo/bar/baz/qux
+}
+
 func ExampleURL_MarshalBinary() {
 	u, _ := url.Parse("https://example.org")
 	b, err := u.MarshalBinary()
@@ -365,7 +377,7 @@ func ExampleURL_RequestURI() {
 	// Output: /path?foo=bar
 }
 
-func toJSON(m interface{}) string {
+func toJSON(m any) string {
 	js, err := json.Marshal(m)
 	if err != nil {
 		log.Fatal(err)
